@@ -24,9 +24,9 @@
          validators = [],
          unstaked_validators = [],
          group,
-         accounts,
          account_addrs,
 
+         accounts,
          height = 1,
          pending_txns = #{},
          prepending_unstake = #{},
@@ -69,11 +69,12 @@
 %%      initial state is supplied explicitly to, e.g. commands/2.)
 -spec initial_state() -> eqc_statem:symbolic_state().
 initial_state() ->
+    AccountIds = lists:seq(1, ?num_accounts),  %% account zero is GenOwner
     #s{init = false,
        accounts = maps:from_list(
-                    lists:zip(lists:seq(1, ?num_accounts),
-                              lists:duplicate(?num_accounts, {?initial_balance,
-                                                              ?initial_balance})))
+                    lists:zip(AccountIds,
+                              lists:duplicate(length(AccountIds),
+                                              {?initial_balance, ?initial_balance})))
       }.
 
 init_chain_env() ->
@@ -183,7 +184,7 @@ command_precondition_common(S, Cmd) ->
     S#s.init /= false orelse Cmd == init.
 
 invariant(#s{chain = undefined}) ->
-    true;
+    true;  %% when chain is not yet initialized
 invariant(#s{chain = Chain,
              validators = Vals,
              pending_unstake = Pends,
@@ -270,14 +271,6 @@ invariant(#s{chain = Chain,
     catch throw:E ->
             E
     end.
-
-%% doing this for the side-effects, not sure if it's right :/
-add_block(Chain, {ok, _Valid, _Invalid, Block}) ->
-    ok = blockchain:add_block(Block, Chain),
-    Chain;
-add_block(Chain, {_NewGroup, Block}) ->
-    ok = blockchain:add_block(Block, Chain),
-    Chain.
 
 %% generalize?
 add_pending({_ok, _Addr, Txn}, ID, Pending, Reason) ->
@@ -673,7 +666,7 @@ election_pre(S, _) ->
     S#s.height rem 3 == 0.
 
 election_args(S) ->
-    [S#s.height, {var, chain},  S#s.validators, S#s.group].
+    [S#s.height, S#s.chain, S#s.validators, S#s.group].
 
 election(Height, Chain, Validators, CurrGroup)  ->
     Ledger = blockchain:ledger(Chain),
@@ -693,17 +686,14 @@ election(Height, Chain, Validators, CurrGroup)  ->
                  NewGroup, Proof, Height, 0),
 
     {ok, _Valid, _Invalid, NewBlock} = block(Chain, CurrGroup, Validators, #{whatever => {valid, GroupTxn}}),
-
+    %% indirect call to model function block adds block to chain
     {NewGroup, NewBlock}.
 
-election_next(#s{pending_txns = PendTxns} = S,
-              V,
-              _Args) ->
+election_next(#s{pending_txns = PendTxns} = S, V, _Args) ->
     NewHeight = S#s.height + 1,
     Update = ?call(fixup_txns, [S#s.group, V, PendTxns,
                                 S#s.prepending_unstake, S#s.pretransfer]),
-    S#s{chain = ?call(add_block, [S#s.chain, V]),
-        group = ?call(update_group, [V]),
+    S#s{group = ?call(update_group, [V]),
         pretransfer = {call, erlang, element, [3, Update]},
         prepending_unstake = {call, erlang, element, [2, Update]},
         pending_txns = {call, erlang, element, [1, Update]},
@@ -788,7 +778,7 @@ fixup_txns(OldGroup, {NewGroup, _}, Pending, Unstake, Pretransfer) ->
 
 
 block_args(S) ->
-    [{var, chain}, S#s.group, S#s.validators, S#s.pending_txns].
+    [S#s.chain, S#s.group, S#s.validators, S#s.pending_txns].
 
 block(Chain, Group, Validators, Txns) ->
     STxns = lists:sort(fun blockchain_txn:sort/2, element(2, lists:unzip(maps:values(Txns)))),
@@ -814,14 +804,14 @@ block(Chain, Group, Validators, Txns) ->
     Signatures = signatures(Group, Validators, BinBlock),
     Block1 = blockchain_block:set_signatures(Block0, Signatures),
     %% lager:info("txns ~p", [Block1]),
+    ok = blockchain:add_block(Block1, Chain),
     {ok, Valid, Invalid, Block1}.
 
 block_next(#s{} = S,
            V,
-           [Chain, _Group, _, _Transactions]) ->
+           [_Chain, _Group, _, _Transactions]) ->
     NewHeight = S#s.height + 1,
-    S#s{chain = ?call(add_block, [Chain, V]),
-        height = NewHeight,
+    S#s{height = NewHeight,
 
         accounts = ?call(block_update_accounts, [NewHeight, S#s.accounts,
                                                  S#s.pending_validators,
