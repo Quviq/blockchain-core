@@ -934,24 +934,25 @@ block_post(#s{pending_txns = Pend,
 
 %% -- Property ---------------------------------------------------------------
 prop_stake() ->
+    with_parameters(
+      [{show_states, false},  % make true to print state at each transition
+       {print_counterexample, true}],
     ?FORALL(
        %% default to longer commands sequences for better coverage
        Cmds, more_commands(25, commands(?M)),
        %% Cmds, noshrink(more_commands(5, commands(?M))),
-       with_parameters(
-         [{show_states, false},  % make true to print state at each transition
-          {print_counterexample, true}],
-         aggregate(command_names(Cmds),
-                   begin
-                       Env = init_chain_env(),
-                       {H, S, Res} = run_commands(Cmds, Env),
-                       eqc_statem:pretty_commands(?M,
-                                                  Cmds,
-                                                  {H, S, Res},
-                                                  Env,
-                                                  cleanup(eqc_symbolic:eval(S), Env)
-                                                  andalso Res == ok)
-                   end))).
+       begin
+           Env = init_chain_env(),
+           {H, S, Res} = run_commands(Cmds, Env),
+           %% measure(height, S#s.height,
+           aggregate(command_names(Cmds),
+           eqc_statem:pretty_commands(?M,
+                                      Cmds,
+                                      {H, S, Res},
+                                      Env,
+                                      cleanup(eqc_symbolic:eval(S), Env)
+                                      andalso Res == ok))
+       end)).
 
 %% @doc Run property repeatedly to find as many different bugs as
 %% possible. Runs for 10 seconds before giving up finding more bugs.
