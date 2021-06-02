@@ -963,6 +963,9 @@ bugs(Time, Bugs) ->
 
 %%% helpers
 
+
+%% THIS is a fat NO-No. No randomness other than by QuickCheck
+%% If you do this, you cannot replay the same test and hence cannot shrink
 select([]) ->
     error(zero_len_list);
 select(Lst0) ->
