@@ -71,10 +71,11 @@
 initial_state() ->
     AccountIds = lists:seq(1, ?num_accounts),  %% account zero is GenOwner
     #s{init = false,
-       accounts = maps:from_list(
-                    lists:zip(AccountIds,
-                              lists:duplicate(length(AccountIds),
-                                              {?initial_balance, ?initial_balance})))
+       accounts = %% abstract, but not symbolic
+           maps:from_list(
+             lists:zip(AccountIds,
+                       lists:duplicate(length(AccountIds),
+                                       {?initial_balance, ?initial_balance})))
       }.
 
 init_chain_env() ->
@@ -384,20 +385,17 @@ stake_txn(#account{address = Account0,
         _ ->
             STxn
     end.
+
 %% todo: try with mainnet/testnet keys
 stake_next(#s{} = S,
            V,
            [_SymAccounts, _Dead, _Accounts, Reason]) ->
     S#s{%% accounts = ?call(update_accounts, [stake, SymAccounts, Reason, V]),
         pending_txns = ?call(add_pending, [V, S#s.txn_ctr, S#s.pending_txns, Reason]),
-        pending_validators = ?call(update_validators, [S#s.pending_validators, Reason, V]),
+        pending_validators = S#s.pending_validators ++ [?call(update_validators, [V]) || Reason == valid],
         txn_ctr = S#s.txn_ctr + 1}.
 
-update_validators(Validators, Reason, {ok, Val, _Txn}) ->
-    case Reason of
-        valid -> Validators ++ [Val];
-        _ -> Validators
-    end.
+update_validators({ok, Val, _Txn}) -> Val.
 
 %% unstake command
 unstake_dynamicpre(#s{unstaked_validators = Dead0},
