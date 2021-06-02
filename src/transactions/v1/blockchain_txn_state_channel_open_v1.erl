@@ -231,17 +231,18 @@ do_is_valid_checks(Txn, Chain) ->
                                                 _ ->
                                                     case blockchain_ledger_v1:find_state_channel(ID, Owner, Ledger) of
                                                         {error, not_found} ->
-                                                            case blockchain_ledger_v1:find_entry(Owner, Ledger) of
+                                                            %% No state channel with this ID for this Owner exists
+                                                            case blockchain_ledger_v1:find_dc_entry(Owner, Ledger) of
                                                                 {error, _}=Error0 ->
                                                                     Error0;
                                                                 {ok, Entry} ->
                                                                     TxnNonce = ?MODULE:nonce(Txn),
-                                                                    NextLedgerNonce = blockchain_ledger_entry_v1:nonce(Entry) +1,
+                                                                    NextLedgerNonce = blockchain_ledger_data_credits_entry_v1:nonce(Entry) +1,
                                                                     case TxnNonce =:= NextLedgerNonce of
                                                                         false ->
                                                                             {error, {bad_nonce, {state_channel_open, TxnNonce, NextLedgerNonce}}};
                                                                         true ->
-                                                                            %% No state channel with this ID for this Owner exists
+
                                                                             AreFeesEnabled = blockchain_ledger_v1:txn_fees_active(Ledger),
                                                                             TxnFee = ?MODULE:fee(Txn),
                                                                             OriginalAmount = ?MODULE:amount(Txn),
