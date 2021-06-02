@@ -332,12 +332,14 @@ stake_dynamicpre(_S, [Accounts, _Dead, _DynAccts, balance]) ->
 stake_dynamicpre(_S, [Accounts, _Dead, _DynAccts, _]) ->
     maps:size(maps:filter(fun ge_stake/2, Accounts)) =/= 0.
 
+%% Given the reason, other parts can be selected easier
 stake_args(S) ->
-    oneof([[S#s.accounts, S#s.unstaked_validators, {var, accounts}, valid],
-           [S#s.accounts, S#s.unstaked_validators, {var, accounts}, balance],
-           [S#s.accounts, S#s.unstaked_validators, {var, accounts}, bad_sig],
-           [S#s.accounts, S#s.unstaked_validators, {var, accounts}, bad_validator],
-           [S#s.accounts, S#s.unstaked_validators, {var, accounts}, bad_owner]]).
+    ?LET(Reason, elements([valid, balance, bad_sig, bad_validator, bad_owner]),
+         [S#s.accounts, case Reason of
+                            bad_validator when S#s.unstaked_validators /= [] ->
+                                elements(S#s.unstaked_validators);
+                            _ -> undefined
+                        end, {var, accounts}, Reason]).
 
 stake(SymAccts, Dead, Accounts, Reason) ->
     %% todo rich accounts vs poor accounts
@@ -348,8 +350,7 @@ stake(SymAccts, Dead, Accounts, Reason) ->
     {Val, Addr, Account} =
         case Reason of
             bad_validator ->
-                V = select(Dead),
-                {V, V#validator.addr, V#validator.owner};
+                {Dead, Dead#validator.addr, Dead#validator.owner};
             _ ->
                 Acct = select(maps:keys(maps:filter(Filter, SymAccts))),
                 [{Address, {_, _, Sig}}] = test_utils:generate_keys(1),
