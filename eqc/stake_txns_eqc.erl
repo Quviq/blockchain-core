@@ -168,10 +168,16 @@ weight(_S, stake) ->
     30;
 weight(_S, unstake) ->
     30;
-weight(_S, election) ->
-    100;
-weight(_S, block) ->
-    100.
+weight(S, election) ->
+    %% Make it likely to pick election command at height that election may take place
+    if S#s.height rem ?election_interval == 0 -> 100;
+       true -> 10
+    end;
+weight(S, block) ->
+    %% Favour election over block at height that election may take place
+    if S#s.height rem ?election_interval == 0 -> 10;
+       true -> 100
+    end.
 
 command_precondition_common(S, Cmd) ->
     S#s.init /= false orelse Cmd == init.
@@ -783,8 +789,7 @@ fixup_txns(OldGroup, {NewGroup, _}, Pending, Unstake, Pretransfer) ->
       Pending).
 
 %% block commands
-block_pre(S, _) ->
-    S#s.height rem 5 =/= 0.
+
 
 block_args(S) ->
     [{var, chain}, S#s.group, S#s.validators, S#s.pending_txns].
@@ -944,14 +949,14 @@ prop_stake() ->
        begin
            Env = init_chain_env(),
            {H, S, Res} = run_commands(Cmds, Env),
-           %% measure(height, S#s.height,
+           measure(height, S#s.height,
            aggregate(command_names(Cmds),
            eqc_statem:pretty_commands(?M,
                                       Cmds,
                                       {H, S, Res},
                                       Env,
                                       cleanup(eqc_symbolic:eval(S), Env)
-                                      andalso Res == ok))
+                                      andalso Res == ok)))
        end)).
 
 %% @doc Run property repeatedly to find as many different bugs as
