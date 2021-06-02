@@ -309,10 +309,16 @@ init_accts(Accounts) ->
                       Acc#{Addr => ID}
               end, #{}, Accounts).
 
-lt_stake(_, {Bones, _}) ->
+lt_stake(_, Value) ->
+    lt_stake(Value).
+
+lt_stake({Bones, _}) ->
     Bones < ?min_stake.
 
-ge_stake(_, {Bones, _}) ->
+ge_stake(_, Value) ->
+    ge_stake(Value).
+
+ge_stake({Bones, _}) ->
     Bones >= ?min_stake.
 
 %% stake command
