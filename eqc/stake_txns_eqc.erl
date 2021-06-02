@@ -69,7 +69,7 @@
 %%      initial state is supplied explicitly to, e.g. commands/2.)
 -spec initial_state() -> eqc_statem:symbolic_state().
 initial_state() ->
-    #s{
+    #s{init = false,
        accounts = maps:from_list(
                     lists:zip(lists:seq(1, ?num_accounts),
                               lists:duplicate(?num_accounts, {?initial_balance,
@@ -118,7 +118,7 @@ init_chain_env() ->
          || Addr <- Addresses],
 
     GenConsensusGroupTx = blockchain_txn_consensus_group_v1:new(
-                            [Addr || #validator{addr = Addr} <- GenesisMembers], <<"proof">>, 1, 0),
+                            Addresses, <<"proof">>, 1, 0),
     Txs = InitialVars ++
         GenPaymentTxs ++
         InitialConsensusTxn ++
@@ -132,8 +132,8 @@ init_chain_env() ->
     [{chain, Chain},
      {base_dir, BaseDir},
      {accounts, maps:from_list([{ID, Acct} || #account{id = ID} = Acct <- Accounts])},
-     {validators, GenesisMembers},
-     {group, GenesisMembers}].
+     {validators, maps:from_list([{Addr, V} || #validator{addr = Addr} = V <- GenesisMembers])},
+     {group, Addresses}].
 
 make_base_dir() ->
     "stake-txns-dir-"++integer_to_list(rand:uniform(8999999) + 1000000).
@@ -296,29 +296,25 @@ init_pre(S, _) ->
     S#s.init == false.
 
 init_args(_S) ->
-    [{var, chain}, {var, accounts}, {var, group}].
+    [].
 
-init(Chain, Accounts, Group) ->
-    {Chain, Accounts, Group}.
+%% This will generate a new state in which environment variables are
+%% used inside symbolic calls. The invariant and post condition see the
+%% dynamic values
+init() ->
+    ok.
 
-init_next(S, R, _) ->
+init_next(S, _, []) ->
     S#s{init = true,
-        chain = {call, erlang, element, [1, R]},
-        group = ?call(init_group, [R]),
-        validators = ?call(init_vals, [R]),
-        account_addrs = ?call(init_accts, [R])}.
+        chain = {var, chain},
+        group = {var, group},
+        validators = {var, validators},
+        account_addrs = {call, ?M, init_accts, [{var, accounts}]}}.
 
-init_accts({_Chain, Accounts, _Group}) ->
+init_accts(Accounts) ->
     maps:fold(fun(ID, #account{address = Addr}, Acc) ->
                       Acc#{Addr => ID}
               end, #{}, Accounts).
-
-init_group({_Chain, _Accounts, Group}) ->
-    [Addr || #validator{addr = Addr} <- Group].
-
-init_vals({_Chain, _Accounts, Group}) ->
-    maps:from_list(
-      [{Addr, V} || V = #validator{addr = Addr} <- Group]).
 
 lt_stake(_, {Bones, _}) ->
     Bones < ?min_stake.
