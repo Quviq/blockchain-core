@@ -25,6 +25,7 @@
          unstaked_validators = [],
          group,
          account_addrs,
+         chain_accounts,
 
          accounts,
          height = 1,
@@ -285,6 +286,19 @@ update_pending({ok, Valid, Invalid0, _Block}, Pending) ->
               not lists:member(Txn, ToRemove)
       end, Pending).
 
+%% -- Give commands access to reading the state at runtime -------------------
+
+wrap_call(S, {call, Mod, Cmd, Args}) when Cmd == stake ->
+    try {ok, apply(Mod, Cmd, [S | Args])}
+    catch
+        _:Reason:ST -> {error, {'EXIT', {Reason, ST}}, []}
+    end;
+wrap_call(_S, {call, Mod, Cmd, Args}) ->
+    try  {ok, apply(Mod, Cmd, Args)}
+    catch
+        _:Reason:ST -> {error, {'EXIT', {Reason, ST}}, []}
+    end.
+
 %% -- Commands ---------------------------------------------------------------
 init_pre(S, _) ->
     S#s.init == false.
@@ -303,6 +317,7 @@ init_next(S, _, []) ->
         chain = {var, chain},
         group = {var, group},
         validators = {var, validators},
+        chain_accounts = {var, accounts},
         account_addrs = {call, ?M, init_accts, [{var, accounts}]}}.
 
 init_accts(Accounts) ->
@@ -322,47 +337,44 @@ ge_stake(_, Value) ->
 ge_stake({Bones, _}) ->
     Bones >= ?min_stake.
 
-%% stake command
-stake_dynamicpre(#s{unstaked_validators = Dead0}, [_, _, _, bad_validator]) ->
+%% stake command ---------------------------------------------
+stake_dynamicpre(#s{unstaked_validators = Dead0}, [_, _, bad_validator]) ->
     Dead = lists:flatten(Dead0),
     Dead /= [];
-stake_dynamicpre(_S, [Accounts, _Dead, _DynAccts, balance]) ->
-    maps:size(maps:filter(fun lt_stake/2, Accounts)) =/= 0;
+stake_dynamicpre(S, [Account, _Dead, balance]) ->
+    lists:member(Account, maps:keys(maps:filter(fun lt_stake/2, S#s.accounts)));
 %% we need at least one possible staker for these others to be reasonable
-stake_dynamicpre(_S, [Accounts, _Dead, _DynAccts, _]) ->
-    maps:size(maps:filter(fun ge_stake/2, Accounts)) =/= 0.
+stake_dynamicpre(S, [Account, _Dead, _]) ->
+    lists:member(Account, maps:keys(maps:filter(fun ge_stake/2, S#s.accounts))).
 
 %% Given the reason, other parts can be selected easier
 stake_args(S) ->
     ?LET(Reason, fault(elements([balance, bad_sig, bad_validator, bad_owner]), valid),
-         [S#s.accounts, case Reason of
-                            bad_validator when S#s.unstaked_validators /= [] ->
-                                elements(S#s.unstaked_validators);
-                            _ -> undefined
-                        end, {var, accounts}, Reason]).
+         [choose(1, ?num_accounts),  %% at the moment symbolic accounts not abstract
+          case Reason of
+              bad_validator when S#s.unstaked_validators /= [] ->
+                  elements(S#s.unstaked_validators);
+              _ -> undefined
+          end, Reason]).
 
-stake(SymAccts, Dead, Accounts, Reason) ->
-    %% todo rich accounts vs poor accounts
-    Filter = case Reason of
-                 balance -> fun lt_stake/2;
-                 _ -> fun ge_stake/2
-             end,
-    {Val, Addr, Account} =
+stake(S, Account, Dead,  Reason) ->
+    Accounts = S#s.chain_accounts,
+
+    {Val, Addr, Acct} =
         case Reason of
             bad_validator ->
                 {Dead, Dead#validator.addr, Dead#validator.owner};
             _ ->
-                Acct = select(maps:keys(maps:filter(Filter, SymAccts))),
                 [{Address, {_, _, Sig}}] = test_utils:generate_keys(1),
-                {#validator{owner = Acct,
+                {#validator{owner = Account,
                             addr = Address,
                             sig_fun = Sig,
                             stake = ?min_stake},
                  Address,
-                 Acct}
+                 Account}
         end,
-    lager:info("val ~p acct ~p reason ~p", [Val, Account, Reason]),
-    Txn = stake_txn(maps:get(Account, Accounts), Addr, Reason),
+    lager:info("val ~p acct ~p reason ~p", [Val, Acct, Reason]),
+    Txn = stake_txn(maps:get(Acct, Accounts), Addr, Reason),
     {ok, Val, Txn}.
 
 stake_txn(#account{address = Account0,
@@ -390,7 +402,7 @@ stake_txn(#account{address = Account0,
 %% todo: try with mainnet/testnet keys
 stake_next(#s{} = S,
            V,
-           [_SymAccounts, _Dead, _Accounts, Reason]) ->
+           [_SymAccounts, _Dead, Reason]) ->
     S#s{%% accounts = ?call(update_accounts, [stake, SymAccounts, Reason, V]),
         pending_txns = ?call(add_pending, [V, S#s.txn_ctr, S#s.pending_txns, Reason]),
         pending_validators = S#s.pending_validators ++ [?call(update_validators, [V]) || Reason == valid],
@@ -398,7 +410,7 @@ stake_next(#s{} = S,
 
 update_validators({ok, Val, _Txn}) -> Val.
 
-%% unstake command
+%% unstake command ---------------------------------------------
 unstake_dynamicpre(#s{unstaked_validators = Dead0},
                    [_, _, _, _, _, _, _, bad_validator]) ->
     Dead = lists:flatten(Dead0),
@@ -503,7 +515,7 @@ unstake_txn(#validator{owner = Owner, addr = Addr}, Accounts, Height, Reason) ->
 
     end.
 %%%%
-%%% transfer command
+%%% transfer command ---------------------------------------------
 %%%%
 
 transfer_dynamicpre(#s{pretransfer = Pretransfer0,
@@ -666,7 +678,7 @@ transfer_txn(#validator{owner = Owner, addr = Addr},
         end,
     {FinalTxn, Amt, NewVal}.
 
-%% election psuedo-commands
+%% election psuedo-commands ---------------------------------------------
 election_pre(S, _) ->
     S#s.height rem 3 == 0.
 
@@ -779,7 +791,7 @@ fixup_txns(OldGroup, {NewGroup, _}, Pending, Unstake, Pretransfer) ->
       {#{}, Unstake, Pretransfer},
       Pending).
 
-%% block commands
+%% block commands ---------------------------------------------
 
 
 block_args(S) ->
