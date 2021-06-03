@@ -172,13 +172,15 @@ weight(_S, stake) ->
 weight(_S, unstake) ->
     30;
 weight(S, election) ->
+    Interval = maps:get(?election_interval, val_vars()),
     %% Make it likely to pick election command at height that election may take place
-    if S#s.height rem ?election_interval == 0 -> 100;
+    if S#s.height rem Interval == 0 -> 100;
        true -> 10
     end;
 weight(S, block) ->
+    Interval = maps:get(?election_interval, val_vars()),
     %% Favour election over block at height that election may take place
-    if S#s.height rem ?election_interval == 0 -> 10;
+    if S#s.height rem Interval -> 10;
        true -> 100
     end.
 
