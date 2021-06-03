@@ -334,7 +334,7 @@ stake_dynamicpre(_S, [Accounts, _Dead, _DynAccts, _]) ->
 
 %% Given the reason, other parts can be selected easier
 stake_args(S) ->
-    ?LET(Reason, elements([valid, balance, bad_sig, bad_validator, bad_owner]),
+    ?LET(Reason, fault(elements([balance, bad_sig, bad_validator, bad_owner]), valid),
          [S#s.accounts, case Reason of
                             bad_validator when S#s.unstaked_validators /= [] ->
                                 elements(S#s.unstaked_validators);
@@ -929,10 +929,12 @@ block_post(#s{pending_txns = Pend,
     end.
 
 %% -- Property ---------------------------------------------------------------
+%% prop_stake() ->
+%%     with_parameters(
+%%       [{show_states, false},  % make true to print state at each transition
+%%        {print_counterexample, true}],
 prop_stake() ->
-    with_parameters(
-      [{show_states, false},  % make true to print state at each transition
-       {print_counterexample, true}],
+    fault_rate(1, 20,
     ?FORALL(
        %% default to longer commands sequences for better coverage
        Cmds, more_commands(25, commands(?M)),
