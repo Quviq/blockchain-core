@@ -384,28 +384,16 @@ stake_args(S) ->
              _ ->
                  [Account, Validator, Reason]
          end)).
+
+
 stake(S, Account, Validator,  Reason) ->
-    Accounts = S#s.chain_accounts,
-
     lager:info("val ~p acct ~p reason ~p", [Validator, Account, Reason]),
-    stake_txn(maps:get(Account, Accounts), Validator#validator.addr, Reason).
+    {AccountAddress, SigFun} = fault_inject(S, Account, Reason),
+    stake_txn(Validator#validator.addr, AccountAddress, SigFun).
 
-stake_txn(#account{address = Address0,
-                   sig_fun = SigFun0}, Val, Reason) ->
-    [{WrongAddress, {_, _, WrongSigFun}}] = test_utils:generate_keys(1),
-    Account =
-        case Reason of
-            bad_owner ->
-                WrongAddress;
-            _ -> Address0
-        end,
-    SigFun =
-        case Reason of
-            bad_sig -> WrongSigFun;
-            _ -> SigFun0
-        end,
+stake_txn(Val, AccountAddress, SigFun) ->
     Txn = blockchain_txn_stake_validator_v1:new(
-            Val, Account,
+            Val, AccountAddress,
             ?min_stake,
             35000
            ),
@@ -1041,3 +1029,15 @@ cleanup(#s{}, Env) ->
     PWD = string:trim(os:cmd("pwd")),
     os:cmd("rm -r " ++ PWD ++ "/" ++ Dir),
     true.
+
+%% returns AccountAddress, SigFun with possible fault injected
+fault_inject(S, Account, Reason) ->
+    #account{address = Address,
+             sig_fun = SigFun} = maps:get(Account, S#s.chain_accounts),
+    [{WrongAddress, {_, _, WrongSigFun}}] = test_utils:generate_keys(1),
+    case Reason of
+        bad_owner -> {WrongAddress, SigFun};
+        bad_sig -> {Address, WrongSigFun};
+        _ ->
+            {Address, SigFun}
+    end.
