@@ -949,12 +949,13 @@ prop_stake() ->
            {H, S, Res} = run_commands(Cmds, Env),
            measure(height, S#s.height,
            aggregate(command_names(Cmds),
+           aggregate(with_title("abstract transactions"), S#s.txs,
            eqc_statem:pretty_commands(?M,
                                       Cmds,
                                       {H, S, Res},
                                       Env,
                                       cleanup(eqc_symbolic:eval(S), Env)
-                                      andalso Res == ok)))
+                                      andalso Res == ok))))
        end)).
 
 %% @doc Run property repeatedly to find as many different bugs as
