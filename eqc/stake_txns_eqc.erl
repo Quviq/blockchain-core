@@ -22,6 +22,7 @@
          chain,
          pending_validators = [],
          validators = [],
+         a_validators = [],   %% [{nat(), #validator{}}] valid validators for account N
          unstaked_validators = [],
          group,
          account_addrs,
@@ -68,9 +69,16 @@
 
 %% @doc Returns the state in which each test case starts. (Unless a different
 %%      initial state is supplied explicitly to, e.g. commands/2.)
+%%
+%% In the future we want to derive the initial state for testing from now
+%% hard coded values for total number of initial accounts and initial group size.
+%% We parameterize this to allow future changes.
 -spec initial_state() -> eqc_statem:symbolic_state().
 initial_state() ->
     AccountIds = lists:seq(1, ?num_accounts),  %% account zero is GenOwner
+    initial_state(AccountIds).
+
+initial_state(AccountIds) ->
     #s{init = false,
        accounts = %% abstract, but not symbolic
            maps:from_list(
@@ -165,6 +173,8 @@ val_vars() ->
 
 weight(_S, init) ->
     1;
+weight(S, validator) ->
+    50 - length(S#s.a_validators);
 weight(_S, transfer) ->
     50;
 weight(_S, stake) ->
@@ -277,8 +287,13 @@ invariant(#s{chain = Chain,
     end.
 
 %% generalize?
-add_pending({_ok, _Addr, Txn}, ID, Pending, Reason) ->
+add_pending({ok, _Addr, Txn}, ID, Pending, Reason) ->
+    Pending#{ID => {Reason, Txn}};
+add_pending({ok, _Addr, Txn, _UnstakeHeight}, ID, Pending, Reason) ->
+    Pending#{ID => {Reason, Txn}};
+add_pending(Txn, ID, Pending, Reason) ->
     Pending#{ID => {Reason, Txn}}.
+
 
 update_pending({ok, Valid, Invalid0, _Block}, Pending) ->
     {Invalid, _Reasons} = lists:unzip(Invalid0),
@@ -327,17 +342,9 @@ init_accts(Accounts) ->
                       Acc#{Addr => ID}
               end, #{}, Accounts).
 
-lt_stake(_, Value) ->
-    lt_stake(Value).
 
-lt_stake({Bones, _}) ->
-    Bones < ?min_stake.
 
-ge_stake(_, Value) ->
-    ge_stake(Value).
 
-ge_stake({Bones, _}) ->
-    Bones >= ?min_stake.
 
 %% stake command ---------------------------------------------
 stake_dynamicpre(#s{unstaked_validators = Dead0}, [_, _, bad_validator]) ->
@@ -1012,6 +1019,18 @@ selectable_group_vals(Group, Vals0) ->
               end
       end,
       [], Group).
+
+lt_stake(_, Value) ->
+    lt_stake(Value).
+
+lt_stake({Bones, _}) ->
+    Bones < ?min_stake.
+
+ge_stake(_, Value) ->
+    ge_stake(Value).
+
+ge_stake({Bones, _}) ->
+    Bones >= ?min_stake.
 
 cleanup(#s{}, Env) ->
     Dir = maps:get(base_dir, maps:from_list(Env)),
