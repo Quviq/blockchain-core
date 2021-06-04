@@ -342,8 +342,22 @@ init_accts(Accounts) ->
                       Acc#{Addr => ID}
               end, #{}, Accounts).
 
+%% --- Operation: validator ---
+%% create a new VALID validator and add symbolic representation to state
 
+validator_args(_S) ->
+    [choose(1, ?num_accounts)].
 
+validator(Account) ->
+    [{Address, {_, _, Sig}}] = test_utils:generate_keys(1),
+    #validator{owner = Account,
+               addr = Address,
+               sig_fun = Sig,
+               stake = ?min_stake}.
+
+%% The symbolic variable ensures that we later use the right validator for the intended validation
+validator_next(S, V, [Account]) ->
+    S#s{a_validators = S#s.a_validators ++ [{Account, V}]}.
 
 
 %% stake command ---------------------------------------------
@@ -356,68 +370,57 @@ stake_dynamicpre(S, [Account, _Dead, balance]) ->
 stake_dynamicpre(S, [Account, _Dead, _]) ->
     lists:member(Account, maps:keys(maps:filter(fun ge_stake/2, S#s.accounts))).
 
+stake_pre(S) ->
+    S#s.a_validators /= [].
+
 %% Given the reason, other parts can be selected easier
 stake_args(S) ->
-    ?LET(Reason, fault(elements([balance, bad_sig, bad_validator, bad_owner]), valid),
-         [choose(1, ?num_accounts),  %% at the moment symbolic accounts not abstract
-          case Reason of
-              bad_validator when S#s.unstaked_validators /= [] ->
-                  elements(S#s.unstaked_validators);
-              _ -> undefined
-          end, Reason]).
-
-stake(S, Account, Dead,  Reason) ->
+    ?LET(Reason, fault(oneof([balance, bad_sig, bad_owner] ++
+                                 [{bad_validator, V} || V <- S#s.unstaked_validators]), valid),
+    ?LET({Account, Validator}, elements(S#s.a_validators),
+         case Reason of
+             {bad_validator, Dead} ->
+                 [Account, Dead, bad_validator];
+             _ ->
+                 [Account, Validator, Reason]
+         end)).
+stake(S, Account, Validator,  Reason) ->
     Accounts = S#s.chain_accounts,
 
-    {Val, Addr, Acct} =
-        case Reason of
-            bad_validator ->
-                {Dead, Dead#validator.addr, Dead#validator.owner};
-            _ ->
-                [{Address, {_, _, Sig}}] = test_utils:generate_keys(1),
-                {#validator{owner = Account,
-                            addr = Address,
-                            sig_fun = Sig,
-                            stake = ?min_stake},
-                 Address,
-                 Account}
-        end,
-    lager:info("val ~p acct ~p reason ~p", [Val, Acct, Reason]),
-    Txn = stake_txn(maps:get(Acct, Accounts), Addr, Reason),
-    {ok, Val, Txn}.
+    lager:info("val ~p acct ~p reason ~p", [Validator, Account, Reason]),
+    stake_txn(maps:get(Account, Accounts), Validator#validator.addr, Reason).
 
-stake_txn(#account{address = Account0,
-                   sig_fun = SigFun}, Val, Reason) ->
+stake_txn(#account{address = Address0,
+                   sig_fun = SigFun0}, Val, Reason) ->
+    [{WrongAddress, {_, _, WrongSigFun}}] = test_utils:generate_keys(1),
     Account =
         case Reason of
             bad_owner ->
-                [{Acct, _}] = test_utils:generate_keys(1),
-                Acct;
-            _ -> Account0
+                WrongAddress;
+            _ -> Address0
+        end,
+    SigFun =
+        case Reason of
+            bad_sig -> WrongSigFun;
+            _ -> SigFun0
         end,
     Txn = blockchain_txn_stake_validator_v1:new(
             Val, Account,
             ?min_stake,
             35000
            ),
-    STxn = blockchain_txn_stake_validator_v1:sign(Txn, SigFun),
-    case Reason of
-        bad_sig ->
-            blockchain_txn_stake_validator_v1:owner_signature(<<0:512>>, Txn);
-        _ ->
-            STxn
-    end.
+    blockchain_txn_stake_validator_v1:sign(Txn, SigFun).
 
 %% todo: try with mainnet/testnet keys
 stake_next(#s{} = S,
            V,
-           [_SymAccounts, _Dead, Reason]) ->
+           [Account, Validator, Reason]) ->
     S#s{%% accounts = ?call(update_accounts, [stake, SymAccounts, Reason, V]),
         pending_txns = ?call(add_pending, [V, S#s.txn_ctr, S#s.pending_txns, Reason]),
-        pending_validators = S#s.pending_validators ++ [?call(update_validators, [V]) || Reason == valid],
+        pending_validators = S#s.pending_validators ++ [Validator || Reason == valid],
+        txs = S#s.txs ++ [{Reason, stake,  [Account]}],
         txn_ctr = S#s.txn_ctr + 1}.
 
-update_validators({ok, Val, _Txn}) -> Val.
 
 %% unstake command ---------------------------------------------
 unstake_dynamicpre(#s{unstaked_validators = Dead0},
