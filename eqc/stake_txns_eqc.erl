@@ -34,7 +34,8 @@
          prepending_unstake = #{},
          pretransfer = [],
          pending_unstake = #{},
-         txn_ctr = 1
+         txn_ctr = 1,
+         txs = []   %% abstract transactions to be submitted for next block
         }).
 
 -define(call(Fun, ArgList),
@@ -286,11 +287,6 @@ invariant(#s{chain = Chain,
             E
     end.
 
-%% generalize?
-add_pending({ok, _Addr, Txn}, ID, Pending, Reason) ->
-    Pending#{ID => {Reason, Txn}};
-add_pending({ok, _Addr, Txn, _UnstakeHeight}, ID, Pending, Reason) ->
-    Pending#{ID => {Reason, Txn}};
 add_pending(Txn, ID, Pending, Reason) ->
     Pending#{ID => {Reason, Txn}}.
 
@@ -305,7 +301,8 @@ update_pending({ok, Valid, Invalid0, _Block}, Pending) ->
 
 %% -- Give commands access to reading the state at runtime -------------------
 
-wrap_call(S, {call, Mod, Cmd, Args}) when Cmd == stake ->
+wrap_call(S, {call, Mod, Cmd, Args}) when
+      Cmd == stake; Cmd == unstake ->
     try {ok, apply(Mod, Cmd, [S | Args])}
     catch
         _:Reason:ST -> {error, {'EXIT', {Reason, ST}}, []}
@@ -409,18 +406,17 @@ stake_next(#s{} = S,
         txs = S#s.txs ++ [{Reason, stake,  [Account]}],
         txn_ctr = S#s.txn_ctr + 1}.
 
+%% update_validators({ok, Val, _Txn}) -> Val.
 
 %% unstake command ---------------------------------------------
-unstake_dynamicpre(#s{unstaked_validators = Dead0},
-                   [_, _, _, _, _, _, _, bad_validator]) ->
-    Dead = lists:flatten(Dead0),
-    lager:info("XXX ~p ~p", [Dead, Dead0]),
-    Dead /= [];
+unstake_dynamicpre(S,
+                   [_, _, _, bad_validator]) ->
+    lists:flatten(S#s.unstaked_validators) /= [];
 unstake_dynamicpre(#s{pretransfer = Pretransfer0,
                       prepending_unstake = Unstaked,
                       group = Group0,
                       validators = Validators0},
-                   [_, _, _, _, _, _, _, in_group]) ->
+                   [_, _, _, in_group]) ->
     Group = selectable_group_vals(Group0, Validators0),
     Validators = maps:values(maps:filter(fun no_id0/2, Validators0)),
     {Pretransfer, _Amts, _NewVals} = lists:unzip3(Pretransfer0),
@@ -430,7 +426,7 @@ unstake_dynamicpre(#s{pretransfer = Pretransfer0,
                       prepending_unstake = Unstaked,
                       group = Group0,
                       validators = Validators0},
-                   [_, _, _, _, _, _, _, _Reason]) ->
+                   [_, _, _, _Reason]) ->
     Group = selectable_group_vals(Group0, Validators0),
     Validators = maps:values(maps:filter(fun no_id0/2, Validators0)),
     {Pretransfer, _Amts, _NewVals} = lists:unzip3(Pretransfer0),
@@ -441,79 +437,76 @@ no_id0(_, #validator{owner = 0}) ->
 no_id0(_, _) ->
     true.
 
+unstake_pre(S) ->
+    S#s.a_validators /= [].
+
 unstake_args(S) ->
-    oneof([
-           [S#s.height, {var, accounts}, S#s.group, S#s.prepending_unstake,
-            S#s.pretransfer, S#s.validators, S#s.unstaked_validators, valid],
-           [S#s.height, {var, accounts},  S#s.group, S#s.prepending_unstake,
-            S#s.pretransfer, S#s.validators, S#s.unstaked_validators, bad_account],
-           [S#s.height, {var, accounts},  S#s.group, S#s.prepending_unstake,
-            S#s.pretransfer, S#s.validators, S#s.unstaked_validators, bad_sig],
-           [S#s.height, {var, accounts}, S#s.group, S#s.prepending_unstake,
-            S#s.pretransfer, S#s.validators, S#s.unstaked_validators, wrong_account],
-           [S#s.height, {var, accounts}, S#s.group, S#s.prepending_unstake,
-            S#s.pretransfer, S#s.validators, S#s.unstaked_validators, in_group],
-           [S#s.height, {var, accounts}, S#s.group, S#s.prepending_unstake,
-            S#s.pretransfer, S#s.validators, S#s.unstaked_validators, bad_validator]
-          ]).
+    ?LET({Account, Validator}, elements(S#s.a_validators),
+    ?LET(Reason, fault(elements([bad_account, bad_sig,
+                                 {wrong_account, ?SUCHTHAT(N, choose(1,10), N /= Account)}, in_group] ++
+                                    [{bad_validator, V} || V <- S#s.unstaked_validators]), valid),
 
-unstake(Height, Accounts, Group0, Unstaked, Pretransfer0, SymVals, Dead, Reason) ->
-    {Pretransfer, _Amts, _NewVals} = lists:unzip3(Pretransfer0),
-    Group = selectable_group_vals(Group0, SymVals),
-    Val = case Reason of
-              bad_validator -> select(Dead);
-              in_group -> select(Group);
-              _ -> select(maps:values(maps:filter(fun no_id0/2, SymVals))
-                          -- (Group ++ Pretransfer ++ lists:flatten(maps:values(Unstaked))))
-          end,
-    lager:info("unstake ~p reas ~p ded ~p ok ~p",
-               [Val, Reason, Dead,
-                maps:values(maps:filter(fun no_id0/2, SymVals))
-                -- (Group ++ Pretransfer ++ lists:flatten(maps:values(Unstaked)))]),
-    Txn = unstake_txn(Val, Accounts, Height, Reason),
-    {ok, Val, Txn}.
+         [Account,
+          case Reason of
+              in_group ->  %% probably this is the valid one?
+                  ?LET(N, choose(1,4),
+                       {call, maps, get, [{call, lists, nth, [N, S#s.group]}, S#s.validators]});   %% fix this later
+              {bad_validator, Dead} -> Dead;
+              _ ->
+                  Validator  %% by construction owner is not 0
+           end,
+          6,  %% unstakeheight
+          Reason])).
 
-unstake_next(#s{} = S,
-             V,
-             [_Height, _Accounts, _Group, _Vals, _, _, _, Reason]) ->
-    S#s{prepending_unstake = ?call(update_preunstake, [S#s.prepending_unstake, Reason, V]),
-        pending_txns = ?call(add_pending, [V, S#s.txn_ctr, S#s.pending_txns, Reason]),
-        txn_ctr = S#s.txn_ctr + 1}.
+unstake(S, Account, Validator, UnstakeHeight, Reason) ->
+    Height = S#s.height,
+    %% {_Pretransfer, _Amts, _NewVals} = lists:unzip3(Pretransfer0),
+    %% Val = case Reason of
+    %%           bad_validator -> Dead;
+    %%           in_group -> select(Group);
+    %%           _ -> select(maps:values(maps:filter(fun no_id0/2, SymVals))
+    %%                       -- (Group ++ Pretransfer ++ lists:flatten(maps:values(Unstaked))))
+    %%       end,
+    lager:info("unstake ~p reas ~p", [Validator, Reason]),
+    {AccountAddress, SigFun} = fault_inject(S, Account, Reason),
+    unstake_txn(Validator#validator.addr, AccountAddress, SigFun, Height, UnstakeHeight, Reason).
 
-update_preunstake(Pending, valid, {ok, Val, Txn}) ->
-    UnstakeHeight = blockchain_txn_unstake_validator_v1:stake_release_height(Txn),
-    maps:update_with(UnstakeHeight, fun(X) -> [Val | X] end, [Val], Pending);
-update_preunstake(Pending, _Reason, _Res) ->
-    Pending.
-
-unstake_txn(#validator{owner = Owner, addr = Addr}, Accounts, Height, Reason) ->
-    Account =
-        case Reason of
-            %% make up a non-existent account
-            bad_account ->
-                [{Acct, {_, _, Sig}}] = test_utils:generate_keys(1),
-                #account{address = Acct, sig_fun = Sig};
-            %% use existing but non-owner account
-            wrong_account ->
-                element(2, hd(maps:to_list(maps:remove(Owner, Accounts))));
-            _ ->
-                maps:get(Owner, Accounts)
-        end,
-
+unstake_txn(Val, AccountAddress, SigFun, Height, UnstakeHeight, Reason) ->
     Txn = blockchain_txn_unstake_validator_v1:new(
-            Addr, Account#account.address,
+            Val, AccountAddress,
             ?min_stake,
-            Height + 5 + 1,
+            Height + UnstakeHeight,
             35000
            ),
-    STxn = blockchain_txn_unstake_validator_v1:sign(Txn, Account#account.sig_fun),
+    STxn = blockchain_txn_unstake_validator_v1:sign(Txn, SigFun),
     case Reason of
         bad_sig ->
             blockchain_txn_unstake_validator_v1:owner_signature(<<0:512>>, Txn);
         _ ->
             STxn
-
     end.
+
+unstake_next(S, V, [Account, Validator, UnstakeHeight, Reason]) ->
+    S#s{prepending_unstake =
+            if Reason == valid ->
+                    ?call(update_preunstake, [S#s.prepending_unstake, Validator, S#s.height + UnstakeHeight]);
+               true -> S#s.prepending_unstake
+            end,
+        pending_txns = ?call(add_pending, [V, S#s.txn_ctr, S#s.pending_txns, Reason]),
+        txs = S#s.txs ++ [{Reason, unstake,  [Account]}],
+        txn_ctr = S#s.txn_ctr + 1}.
+
+update_preunstake(Pending, Val, UnstakeHeight) ->
+    maps:update_with(UnstakeHeight, fun(X) -> [Val | X] end, [Val], Pending).
+
+unstake_post(S, [_Account, _Validator, UnstakeHeight, Reason], Txn) ->
+    case Reason of
+        valid ->
+            eq(blockchain_txn_unstake_validator_v1:stake_release_height(Txn), S#s.height + UnstakeHeight);
+        _ ->
+            true
+    end.
+
 %%%%
 %%% transfer command ---------------------------------------------
 %%%%
@@ -1038,6 +1031,11 @@ fault_inject(S, Account, Reason) ->
     case Reason of
         bad_owner -> {WrongAddress, SigFun};
         bad_sig -> {Address, WrongSigFun};
+        bad_account -> {WrongAddress, WrongSigFun};
+        {wrong_account, WA} ->
+            #account{address = WAddress,
+                     sig_fun = WSigFun} = maps:get(WA, S#s.chain_accounts),
+            {WAddress, WSigFun};
         _ ->
             {Address, SigFun}
     end.
