@@ -36,6 +36,7 @@
          accounts, %% {nat(), Amount1, Amount2}
          patron, %% zero account
          height = 0,
+         val_ctr = 0,
          txs = []   %% abstract transactions to be submitted for next block
         }).
 
@@ -130,22 +131,23 @@ init_chain_next(S, V, [_]) ->
 validator_pre(S) ->
     length(S#s.validators) < ?initial_validators.
 
-validator_args(_S) ->
-    [0, ?min_stake].
+validator_args(S) ->
+    [S#s.val_ctr, 0, ?min_stake].
 
-validator_pre(S, [Owner, _]) ->
+validator_pre(S, [_, Owner, _]) ->
     lists:keymember(Owner, 1, S#s.accounts).
 
-validator(Owner, Stake) ->
+validator(_, Owner, Stake) ->
     [{Addr, {_Pub, _Priv, SigFun}}] = test_utils:generate_keys(1),
     #validator{owner = Owner,
                addr = Addr,
                sig_fun = SigFun,
                stake = Stake}.
 
-validator_next(S, V, [Owner, Stake]) ->
-    S#s{validators = S#s.validators ++ [{Owner, V, 0}],
-        txs = S#s.txs ++ [{validate_stake, Owner, {call, ?M, validator_address, [V]}, Stake}]}.
+validator_next(S, V, [Ctr, Owner, Stake]) ->
+    S#s{validators = S#s.validators ++ [{Ctr, Owner, V, Stake}],
+        txs = S#s.txs ++ [{validate_stake, Ctr, Owner, Stake}],
+        val_ctr = Ctr + 1}.
 
 
 %% --- Operation: init_accounts ---
@@ -185,11 +187,11 @@ genesis_txs(S, Transactions) ->
           || {coinbase, Id, Balance} <- Transactions ],
 
     InitialConsensusTxn =
-        [blockchain_txn_gen_validator_v1:new(ValAddr, account_address(S, Owner), Stake)
-         || {validate_stake, Owner, ValAddr, Stake} <- Transactions ],
+        [blockchain_txn_gen_validator_v1:new(validator_address(S, Ctr), account_address(S, Owner), Stake)
+         || {validate_stake, Ctr, Owner, Stake} <- Transactions ],
 
     GenConsensusGroupTx = blockchain_txn_consensus_group_v1:new(
-                           [ ValAddr || {validate_stake, _Owner, ValAddr, _Stake} <- Transactions],
+                           [ validator_address(S, Ctr) || {validate_stake, Ctr, _, _} <- Transactions],
                             <<"proof">>, 1, 0),
 
     Txs = InitialVars ++
@@ -241,6 +243,9 @@ balance_post(S, [Account], Res) ->
 
 %%% ----------------------------------------
 
+validator_address(S, Ctr) ->
+     {_, _, #validator{addr = Addr}, _} = lists:keyfind(Ctr, 1, S#s.validators),
+    Addr.
 
 validator_address(#validator{addr = Addr}) ->
     Addr.
