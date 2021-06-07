@@ -28,13 +28,12 @@
         {
          chain,
 
-         validators = [],   %% [{nat(), #validator{}}] valid validators for account N
+         validators = [],
          used_validators = [],   %% cannot be used again?
          group,   %% validators for those that have stake?
          chain_accounts, %% the real accounts
 
-         accounts, %% {nat(), Amount1, Amount2}
-         patron, %% zero account
+         accounts,
          height = 0,
          val_ctr = 0,
          txs = []   %% abstract transactions to be submitted for next block
@@ -56,7 +55,6 @@
         {
          id,
          address,
-         balance,
          sig_fun,
          pub,
          priv
@@ -127,7 +125,7 @@ init_chain(BaseDir) ->
 init_chain_next(S, V, [_]) ->
     S#s{chain = V}.
 
-%% --- Operation: patron ---
+%% --- Operation: validator ---
 validator_pre(S) ->
     length(S#s.validators) < ?initial_validators.
 
@@ -161,7 +159,6 @@ init_accounts(Id, Balance) ->
     [{Addr, {Pub, Priv, SigFun}}] = test_utils:generate_keys(1),
     #account{id = Id,
              address = Addr,
-             balance = Balance,
              sig_fun = SigFun,
              pub = Pub,
              priv = Priv}.
@@ -208,7 +205,7 @@ genesis_txs_next(S, _Value, [Txs]) ->
     S#s{height = 1,
         accounts = update_accounts(S#s.accounts, Txs),
         validators = update_validators(S#s.validators, Txs),
-        group = [ Val || {validator_stake, _, Val, _} <- Txs ],
+        group = [ Ctr || {validate_stake, Ctr, _, _} <- Txs ],
         txs = []}.   %% delete txs from pool
 
 genesis_txs_post(_S, [_], Res) ->
@@ -222,8 +219,8 @@ balance_pre(S) ->
 balance_args(S) ->
     [elements([ Id || {Id, _, _, _} <- S#s.accounts ])].
 
-balance_pre(_S, [_Account]) ->
-    true.
+balance_pre(S, [Account]) ->
+    lists:keymember(Account, 1, S#s.accounts).
 
 balance(S, Id) ->
     Ledger = blockchain:ledger(S#s.chain),
@@ -268,13 +265,13 @@ update_accounts(Accounts, [_ | Txs]) ->
 
 update_validators(Vals, []) ->
     Vals;
-update_validators(Vals, [{validator_stake, Id, Stake} | Txs]) ->
-    NewVals = lists:map(fun({VId, RV, S}) when VId == Id ->
-                                    {VId, RV, S + Stake};
+update_validators(Vals, [{validator_stake, Ctr, Owner, Stake} | Txs]) ->
+    NewVals = lists:map(fun({C, VId, RV, S}) when VId == Owner, C == Ctr ->
+                                    {C, VId, RV, S + Stake};
                                (Val) ->
                                     Val
                             end, Vals),
-    update_accounts(NewVals, Txs);
+    update_validators(NewVals, Txs);
 update_validators(Vals, [_ | Txs]) ->
     update_validators(Vals, Txs).
 
