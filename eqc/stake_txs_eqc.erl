@@ -100,7 +100,7 @@ val_vars() ->
 %% -- Give commands access to reading the state at runtime -------------------
 
 wrap_call(S, {call, Mod, Cmd, Args}) when
-      Cmd == genesis_txs; Cmd == unstake ->
+      Cmd == genesis_txs; Cmd == balance ->
     try {ok, apply(Mod, Cmd, [S | Args])}
     catch
         _:Reason:ST -> {error, {'EXIT', {Reason, ST}}, []}
@@ -145,7 +145,7 @@ validator(Owner, Stake) ->
 
 validator_next(S, V, [Owner, Stake]) ->
     S#s{validators = S#s.validators ++ [{Owner, V, 0}],
-        txs = S#s.txs ++ [{validate_stake, Owner, Stake}]}.
+        txs = S#s.txs ++ [{validate_stake, Owner, {call, ?M, validator_address, [V]}, Stake}]}.
 
 
 %% --- Operation: init_accounts ---
@@ -180,21 +180,18 @@ genesis_txs_args(S) ->
 genesis_txs(S, Transactions) ->
     {InitialVars, _MasterKeys} = blockchain_ct_utils:create_vars(val_vars()),
 
-    GenPaymentTxs = [blockchain_txn_coinbase_v1:new(Addr, Balance)
-                     || {coinbase, Id, Balance} <- Transactions,
-                        {Account, #account{address = Addr}, _, _} <- S#s.accounts,
-                        Account == Id],
+    GenPaymentTxs =
+        [ blockchain_txn_coinbase_v1:new(account_address(S, Id), Balance)
+          || {coinbase, Id, Balance} <- Transactions ],
 
     InitialConsensusTxn =
-        [blockchain_txn_gen_validator_v1:new(Addr, GenOwner#account.address, ?min_stake)
-         || {validate_stake, Id, _Stake} <- Transactions,
-            {Val, #account{address = Addr}, _} <- S#s.validators,
-            {Account, GenOwner, _, _} <- S#s.accounts,
-            Val == Id andalso Account == Id ],
+        [blockchain_txn_gen_validator_v1:new(ValAddr, account_address(S, Owner), Stake)
+         || {validate_stake, Owner, ValAddr, Stake} <- Transactions ],
 
     GenConsensusGroupTx = blockchain_txn_consensus_group_v1:new(
-                           [validator_address(S#s.validators, Id) || {validate_stake, Id, _Stake} <- Transactions],
+                           [ ValAddr || {validate_stake, _Owner, ValAddr, _Stake} <- Transactions],
                             <<"proof">>, 1, 0),
+
     Txs = InitialVars ++
         GenPaymentTxs ++
         InitialConsensusTxn ++
@@ -209,24 +206,48 @@ genesis_txs_next(S, _Value, [Txs]) ->
     S#s{height = 1,
         accounts = update_accounts(S#s.accounts, Txs),
         validators = update_validators(S#s.validators, Txs),
-        group = [ V || {validator_stake, Id, _} <- Txs,
-                       {VId, V, _} <- S#s.validators,
-                       VId == Id ],
+        group = [ Val || {validator_stake, _, Val, _} <- Txs ],
         txs = []}.   %% delete txs from pool
 
 genesis_txs_post(_S, [_], Res) ->
     eq(Res, 1).
 
 
+%% --- Operation: balance ---
+balance_pre(S) ->
+    S#s.height > 0.
 
-validator_address([], Id) ->
-    exit({undefined_validator, Id});
-validator_address([{Id, #validator{addr = Addr}, _}|_], Id) ->
-    Addr;
-validator_address([_ | Vals], Id) ->
-    validator_address(Vals, Id).
+balance_args(S) ->
+    [elements([ Id || {Id, _, _, _} <- S#s.accounts ])].
+
+balance_pre(_S, [_Account]) ->
+    true.
+
+balance(S, Id) ->
+    Ledger = blockchain:ledger(S#s.chain),
+    {ok, Ent} = blockchain_ledger_v1:find_entry(account_address(S, Id), Ledger),
+    blockchain_ledger_entry_v1:balance(Ent).
+
+balance_post(S, [Account], Res) ->
+    case lists:keyfind(Account, 1, S#s.accounts) of
+        {_, _, Balance, _} ->
+            eq(Res, Balance);
+        _ ->
+            false
+    end.
 
 
+
+
+%%% ----------------------------------------
+
+
+validator_address(#validator{addr = Addr}) ->
+    Addr.
+
+account_address(S, Id) ->
+    {Id, #account{address = Addr}, _, _} = lists:keyfind(Id, 1, S#s.accounts),
+    Addr.
 
 update_accounts(Accounts, []) ->
     Accounts;
