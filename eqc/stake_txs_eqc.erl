@@ -193,8 +193,7 @@ genesis_txs(S, Transactions) ->
             Val == Id andalso Account == Id ],
 
     GenConsensusGroupTx = blockchain_txn_consensus_group_v1:new(
-                           [Addr || {validate_stake, Id, _Stake} <- Transactions,
-                                    {Val, #account{address = Addr}, _} <- S#s.validators],
+                           [validator_address(S#s.validators, Id) || {validate_stake, Id, _Stake} <- Transactions],
                             <<"proof">>, 1, 0),
     Txs = InitialVars ++
         GenPaymentTxs ++
@@ -211,13 +210,21 @@ genesis_txs_next(S, _Value, [Txs]) ->
         accounts = update_accounts(S#s.accounts, Txs),
         validators = update_validators(S#s.validators, Txs),
         group = [ V || {validator_stake, Id, _} <- Txs,
-                       {Id, V, _} <- S#s.validators ],
+                       {VId, V, _} <- S#s.validators,
+                       VId == Id ],
         txs = []}.   %% delete txs from pool
 
 genesis_txs_post(_S, [_], Res) ->
     eq(Res, 1).
 
 
+
+validator_address([], Id) ->
+    exit({undefined_validator, Id});
+validator_address([{Id, #validator{addr = Addr}, _}|_], Id) ->
+    Addr;
+validator_address([_ | Vals], Id) ->
+    validator_address(Vals, Id).
 
 
 
