@@ -128,12 +128,30 @@ init_chain(BaseDir) ->
 init_chain_next(S, V, [_]) ->
     S#s{chain = V}.
 
+%% --- Operation: create_account ---
+create_account_pre(S) ->
+    S#s.height > 0.
+
+create_account_args(S) ->
+    [length(S#s.account_idxs)].
+
+create_account(Id) ->
+    [{Addr, {Pub, Priv, SigFun}}] = test_utils:generate_keys(1),
+    #account{id = Id,
+             address = Addr,
+             sig_fun = SigFun,
+             pub = Pub,
+             priv = Priv}.
+
+create_account_next(S, V, [Id]) ->
+    S#s{account_idxs = S#s.account_idxs ++ [{Id, V}]}.
+
 %% --- Operation: validator ---
 validator_pre(S) ->
-    length(S#s.validator_idxs) < ?initial_validators.
+    S#s.account_idxs /= [].
 
 validator_args(S) ->
-    [S#s.val_ctr, 0, ?min_stake].
+    [S#s.val_ctr, elements([Id || {Id, _} <- S#s.account_idxs]), ?min_stake].
 
 validator_pre(S, [_, Owner, _]) ->
     lists:keymember(Owner, 1, S#s.account_idxs).
@@ -146,29 +164,27 @@ validator(_, Owner, Stake) ->
                stake = Stake}.
 
 validator_next(S, V, [Ctr, Owner, Stake]) ->
-    S#s{validator_idxs = S#s.validator_idxs ++ [{Ctr, V}],
+    S#s{validator_idxs = S#s.validator_idxs ++ [{Ctr, V, Owner}],
         txs = S#s.txs ++ [{validate_stake, Ctr, Owner, Stake}],
         val_ctr = Ctr + 1}.
 
 
-%% --- Operation: init_accounts ---
-init_accounts_pre(S) ->
-    length(S#s.account_idxs) =< ?num_accounts.
+%% --- Operation: coinbase ---
+coinbase_pre(S) ->
+    S#s.height == 0
+        andalso length(S#s.account_idxs) =< ?num_accounts.
 
-init_accounts_args(S) ->
+coinbase_args(S) ->
     [length(S#s.account_idxs), ?initial_balance].
 
-init_accounts(Id, _) ->
-    [{Addr, {Pub, Priv, SigFun}}] = test_utils:generate_keys(1),
-    #account{id = Id,
-             address = Addr,
-             sig_fun = SigFun,
-             pub = Pub,
-             priv = Priv}.
+coinbase(Id, _) ->
+    create_account(Id).
 
-init_accounts_next(S, V, [Id, Balance]) ->
-    S#s{account_idxs = S#s.account_idxs ++ [{Id, V}],
-        txs = S#s.txs ++ [{coinbase, Id, Balance}]}.
+coinbase_next(S, V, [Id, Balance]) ->
+    S1 = create_account_next(S, V, [Id]),
+    S1#s{txs = S1#s.txs ++ [{coinbase, Id, Balance}]}.
+
+
 
 %% --- Operation: genesis_txs ---
 genesis_txs_pre(S) ->
@@ -214,6 +230,44 @@ genesis_txs_next(S, _Value, []) ->
 
 genesis_txs_post(_S, [], Res) ->
     eq(Res, 1).
+
+
+%% --- Operation: transfer ---
+transfer_pre(S) ->
+    false andalso S#s.height > 0 andalso S#s.validator_idxs /= [].
+
+transfer_args(S) ->
+    AccountIdxs = [ Id || {Id, _} <- S#s.account_idxs ],
+    ?LET({From, Ctr}, elements([ {Owner, Ctr} || {Ctr, _, Owner} <- S#s.validator_idxs ]),
+         [From, elements(AccountIdxs), choose(0, 40000), Ctr]).
+
+transfer_pre(S, [From, To, _, Validator]) ->
+    lists:keymember(From, 1, S#s.account_idxs) andalso
+        lists:keymember(To, 1, S#s.account_idxs) andalso
+        lists:keymember(Validator, 1, S#s.validator_idxs).
+
+transfer(S, From, To, Amount, Val) ->
+    FromAccount = proplists:get_value(From, S#s.account_idxs),
+    ToAccount = proplists:get_value(To, S#s.account_idxs),
+
+    Txn = blockchain_txn_transfer_validator_stake_v1:new(
+            account_address(ToAccount), account_address(FromAccount),
+            validator_address(S, Val),
+            account_address(FromAccount),
+            account_address(ToAccount),
+            ?min_stake,
+            Amount,
+            35000
+           ),
+    STxn0 = blockchain_txn_transfer_validator_stake_v1:sign(Txn, FromAccount#account.sig_fun),
+    blockchain_txn_transfer_validator_stake_v1:new_owner_sign(STxn0, ToAccount#account.sig_fun).
+
+transfer_next(S, _Value, []) ->
+    S.
+
+transfer_post(_S, [], _Res) ->
+    true.
+
 
 
 %% --- Operation: balance ---
@@ -311,13 +365,16 @@ prop_stake_txs() ->
 
 validator_address(S, Ctr) ->
     case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
-        {_, #validator{addr = Addr}} ->
+        {_, #validator{addr = Addr}, _} ->
             Addr;
         _ ->
             undefined
     end.
 
 validator_address(#validator{addr = Addr}) ->
+    Addr.
+
+account_address(#account{address = Addr}) ->
     Addr.
 
 account_address(S, Id) ->
