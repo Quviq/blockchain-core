@@ -293,20 +293,27 @@ prop_stake_txs() ->
 
            %% cleanup
            os:cmd("rm -r " ++ filename:join(".", BaseDir)),
+
            measure(height, S#s.height,
            aggregate(command_names(Cmds),
            aggregate(with_title("abstract transactions"), S#s.txs,
+           aggregate(call_features(H),
+           features(call_features(H),
            eqc_statem:pretty_commands(?M,
                                       Cmds,
                                       {H, S, Res},
-                                      Res == ok))))
+                                      Res == ok))))))
        end)).
 
 %%% helpers
 
 validator_address(S, Ctr) ->
-    {_, #validator{addr = Addr}} = lists:keyfind(Ctr, 1, S#s.validator_idxs),
-    Addr.
+    case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
+        {_, #validator{addr = Addr}} ->
+            Addr;
+        _ ->
+            undefined
+    end.
 
 validator_address(#validator{addr = Addr}) ->
     Addr.
@@ -316,7 +323,6 @@ account_address(S, Id) ->
         {Id, #account{address = Addr}} ->
             Addr;
         _ ->
-            io:format("not finding account ~p\n", [Id]),
             undefined
     end.
 
