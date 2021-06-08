@@ -28,12 +28,15 @@
         {
          chain,
 
-         validators = [],
          used_validators = [],   %% cannot be used again?
          group,   %% validators for those that have stake?
-         chain_accounts, %% the real accounts
+         validator_idxs = [],
+         account_idxs = [],
+           %% mapping from account to runtime account address and details
+           %% Purposely using a list instead of a map
 
-         accounts,
+         accounts = [],   %% {index, balance, stake}
+         validators = [], %% {index, owner, stake}  probably not needed
          height = 0,
          val_ctr = 0,
          txs = []   %% abstract transactions to be submitted for next block
@@ -99,7 +102,7 @@ val_vars() ->
 %% -- Give commands access to reading the state at runtime -------------------
 
 wrap_call(S, {call, Mod, Cmd, Args}) when
-      Cmd == genesis_txs; Cmd == balance ->
+      Cmd == genesis_txs; Cmd == balances; Cmd == staked ->
     try {ok, apply(Mod, Cmd, [S | Args])}
     catch
         _:Reason:ST -> {error, {'EXIT', {Reason, ST}}, []}
@@ -127,13 +130,13 @@ init_chain_next(S, V, [_]) ->
 
 %% --- Operation: validator ---
 validator_pre(S) ->
-    length(S#s.validators) < ?initial_validators.
+    length(S#s.validator_idxs) < ?initial_validators.
 
 validator_args(S) ->
     [S#s.val_ctr, 0, ?min_stake].
 
 validator_pre(S, [_, Owner, _]) ->
-    lists:keymember(Owner, 1, S#s.accounts).
+    lists:keymember(Owner, 1, S#s.account_idxs).
 
 validator(_, Owner, Stake) ->
     [{Addr, {_Pub, _Priv, SigFun}}] = test_utils:generate_keys(1),
@@ -143,19 +146,19 @@ validator(_, Owner, Stake) ->
                stake = Stake}.
 
 validator_next(S, V, [Ctr, Owner, Stake]) ->
-    S#s{validators = S#s.validators ++ [{Ctr, Owner, V, Stake}],
+    S#s{validator_idxs = S#s.validator_idxs ++ [{Ctr, V}],
         txs = S#s.txs ++ [{validate_stake, Ctr, Owner, Stake}],
         val_ctr = Ctr + 1}.
 
 
 %% --- Operation: init_accounts ---
 init_accounts_pre(S) ->
-    length(S#s.accounts) =< ?initial_validators.
+    length(S#s.account_idxs) =< ?num_accounts.
 
 init_accounts_args(S) ->
-    [length(S#s.accounts), ?initial_balance].
+    [length(S#s.account_idxs), ?initial_balance].
 
-init_accounts(Id, Balance) ->
+init_accounts(Id, _) ->
     [{Addr, {Pub, Priv, SigFun}}] = test_utils:generate_keys(1),
     #account{id = Id,
              address = Addr,
@@ -164,13 +167,13 @@ init_accounts(Id, Balance) ->
              priv = Priv}.
 
 init_accounts_next(S, V, [Id, Balance]) ->
-    S#s{accounts = S#s.accounts ++ [{Id, V, 0, 0}],
+    S#s{account_idxs = S#s.account_idxs ++ [{Id, V}],
         txs = S#s.txs ++ [{coinbase, Id, Balance}]}.
 
 %% --- Operation: genesis_txs ---
 genesis_txs_pre(S) ->
-    S#s.chain /= undefined andalso length(S#s.accounts) > ?initial_validators
-        andalso length(S#s.validators) >= ?initial_validators
+    S#s.chain /= undefined andalso length(S#s.account_idxs) > ?initial_validators
+        andalso length(S#s.validator_idxs) >= ?initial_validators
         andalso S#s.height == 0.
 
 genesis_txs_args(S) ->
@@ -181,7 +184,8 @@ genesis_txs(S, Transactions) ->
 
     GenPaymentTxs =
         [ blockchain_txn_coinbase_v1:new(account_address(S, Id), Balance)
-          || {coinbase, Id, Balance} <- Transactions ],
+          || {coinbase, Id, Balance} <- Transactions,
+             account_address(S, Id) /= undefined],
 
     InitialConsensusTxn =
         [blockchain_txn_gen_validator_v1:new(validator_address(S, Ctr), account_address(S, Owner), Stake)
@@ -203,8 +207,8 @@ genesis_txs(S, Transactions) ->
 
 genesis_txs_next(S, _Value, [Txs]) ->
     S#s{height = 1,
-        accounts = update_accounts(S#s.accounts, Txs),
-        validators = update_validators(S#s.validators, Txs),
+        accounts = update_accounts(S, Txs),
+        %% validators = update_validators(S#s.validators, Txs),
         group = [ Ctr || {validate_stake, Ctr, _, _} <- Txs ],
         txs = []}.   %% delete txs from pool
 
@@ -213,67 +217,56 @@ genesis_txs_post(_S, [_], Res) ->
 
 
 %% --- Operation: balance ---
-balance_pre(S) ->
+balances_pre(S) ->
     S#s.height > 0.
 
-balance_args(S) ->
-    [elements([ Id || {Id, _, _, _} <- S#s.accounts ])].
+balances_args(S) ->
+    [[ Id || {Id, _, _} <- S#s.accounts ]].
 
-balance_pre(S, [Account]) ->
-    lists:keymember(Account, 1, S#s.accounts).
-
-balance(S, Id) ->
+balances(S, Ids) ->
     Ledger = blockchain:ledger(S#s.chain),
-    {ok, Ent} = blockchain_ledger_v1:find_entry(account_address(S, Id), Ledger),
-    blockchain_ledger_entry_v1:balance(Ent).
+    [ case account_address(S, Id) of
+          undefined -> {Id, undefined};
+          Address ->
+              {ok, Ent} = blockchain_ledger_v1:find_entry(Address, Ledger),
+              {Id, blockchain_ledger_entry_v1:balance(Ent)}
+      end || Id <- Ids ].
 
-balance_post(S, [Account], Res) ->
-    case lists:keyfind(Account, 1, S#s.accounts) of
-        {_, _, Balance, _} ->
-            eq(Res, Balance);
-        _ ->
-            false
-    end.
+balances_post(S, [_Ids], Res) ->
+    lists:all(fun({Id, RealBalance}) ->
+                      case lists:keyfind(Id, 1, S#s.accounts) of
+                          {_, Balance, _} ->
+                              eq(RealBalance, Balance);
+                          _ ->
+                              eq(RealBalance, undefined)
+                      end
+              end, Res).
+
+%% --- Operation: staked ---
+staked_pre(S) ->
+    S#s.height > 0.
+
+staked_args(_S) ->
+    [].
+
+staked(S) ->
+    Ledger = blockchain:ledger(S#s.chain),
+    Circ = blockchain_ledger_v1:query_circulating_hnt(Ledger),
+    Cool = blockchain_ledger_v1:query_cooldown_hnt(Ledger),
+    Staked = blockchain_ledger_v1:query_staked_hnt(Ledger),
+    {Staked, Circ, Cool}.
+
+staked_post(S, [], {Staked, _Circ, Cool}) ->
+    eqc_statem:conj(
+      [eqc_statem:tag(staked, eq(Staked, length(S#s.group) * ?min_stake)),
+       %% eqc_statem:tag(circ, eq(Circ, (?num_accounts * 2 - (length(S#s.group) - ?initial_validators) - NumPends) * ?min_stake,
+       eqc_statem:tag(cool, eq(Cool, 0 * ?min_stake))   %% actually pending *
+      ]).
 
 
 
 
 %%% ----------------------------------------
-
-validator_address(S, Ctr) ->
-     {_, _, #validator{addr = Addr}, _} = lists:keyfind(Ctr, 1, S#s.validators),
-    Addr.
-
-validator_address(#validator{addr = Addr}) ->
-    Addr.
-
-account_address(S, Id) ->
-    {Id, #account{address = Addr}, _, _} = lists:keyfind(Id, 1, S#s.accounts),
-    Addr.
-
-update_accounts(Accounts, []) ->
-    Accounts;
-update_accounts(Accounts, [{coinbase, Id, Balance} | Txs]) ->
-    NewAccounts = lists:map(fun({AId, RA, B, S}) when AId == Id ->
-                                    {AId, RA, B + Balance, S};
-                               (Account) ->
-                                    Account
-                            end, Accounts),
-    update_accounts(NewAccounts, Txs);
-update_accounts(Accounts, [_ | Txs]) ->
-    update_accounts(Accounts, Txs).
-
-update_validators(Vals, []) ->
-    Vals;
-update_validators(Vals, [{validator_stake, Ctr, Owner, Stake} | Txs]) ->
-    NewVals = lists:map(fun({C, VId, RV, S}) when VId == Owner, C == Ctr ->
-                                    {C, VId, RV, S + Stake};
-                               (Val) ->
-                                    Val
-                            end, Vals),
-    update_validators(NewVals, Txs);
-update_validators(Vals, [_ | Txs]) ->
-    update_validators(Vals, Txs).
 
 
 
@@ -311,25 +304,43 @@ prop_stake_txs() ->
 
 %%% helpers
 
-abstract_tx_to_txn(Accounts, {payment, From, To, _Tokens}) ->
-    FromAccount = maps:get(From, Accounts),
-    ToAccount = maps:get(To, Accounts),
-    {FromAccount, ToAccount}.
+validator_address(S, Ctr) ->
+    {_, #validator{addr = Addr}} = lists:keyfind(Ctr, 1, S#s.validator_idxs),
+    Addr.
 
+validator_address(#validator{addr = Addr}) ->
+    Addr.
 
-%% returns AccountAddress, SigFun with possible fault injected
-fault_inject(S, Account, Reason) ->
-    #account{address = Address,
-             sig_fun = SigFun} = maps:get(Account, S#s.chain_accounts),
-    [{WrongAddress, {_, _, WrongSigFun}}] = test_utils:generate_keys(1),
-    case Reason of
-        bad_owner -> {WrongAddress, SigFun};
-        bad_sig -> {Address, WrongSigFun};
-        bad_account -> {WrongAddress, WrongSigFun};
-        {wrong_account, WA} ->
-            #account{address = WAddress,
-                     sig_fun = WSigFun} = maps:get(WA, S#s.chain_accounts),
-            {WAddress, WSigFun};
+account_address(S, Id) ->
+    case lists:keyfind(Id, 1, S#s.account_idxs) of
+        {Id, #account{address = Addr}} ->
+            Addr;
         _ ->
-            {Address, SigFun}
+            io:format("not finding account ~p\n", [Id]),
+            undefined
     end.
+
+update_accounts(S, []) ->
+    S#s.accounts;
+update_accounts(S, [{coinbase, Id, Balance} | Txs]) ->
+    case {lists:keyfind(Id, 1, S#s.account_idxs), lists:keyfind(Id, 1, S#s.accounts)} of
+        {false, _} ->
+            update_accounts(S, Txs);
+        {_, {_, B, Stk}} ->
+            NewAccounts = lists:keyreplace(Id, 1, S#s.accounts, {Id, B + Balance, Stk}),
+            update_accounts(S#s{accounts = NewAccounts}, Txs);
+        {_, false} ->
+            update_accounts(S#s{accounts = S#s.accounts ++ [{Id, Balance, 0}]}, Txs)
+    end;
+update_accounts(S, [{validator_stake, _Ctr, Id, Stake} | Txs]) ->
+    case {lists:keyfind(Id, 1, S#s.account_idxs), lists:keyfind(Id, 1, S#s.accounts)} of
+        {false, _} ->
+            update_accounts(S, Txs);
+        {_, {_, B, Stk}} ->
+            NewAccounts = lists:keyreplace(Id, 1, S#s.accounts, {Id, B, Stake + Stk}),
+            update_accounts(S#s{accounts = NewAccounts}, Txs);
+        {_, false} ->
+            update_accounts(S#s{accounts = S#s.accounts ++ [{Id, 0, Stake}]}, Txs)
+    end;
+update_accounts(S, [_ | Txs]) ->
+    update_accounts(S, Txs).
