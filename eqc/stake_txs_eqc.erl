@@ -172,20 +172,20 @@ init_accounts_next(S, V, [Id, Balance]) ->
 
 %% --- Operation: genesis_txs ---
 genesis_txs_pre(S) ->
-    S#s.chain /= undefined andalso length(S#s.account_idxs) > ?initial_validators
-        andalso length(S#s.validator_idxs) >= ?initial_validators
+    S#s.chain /= undefined andalso length(S#s.account_idxs) > 0
+        andalso length(S#s.validator_idxs) > 0
         andalso S#s.height == 0.
 
-genesis_txs_args(S) ->
-    [S#s.txs].
+genesis_txs_args(_S) ->
+    [].
 
-genesis_txs(S, Transactions) ->
+genesis_txs(S) ->
+    Transactions = S#s.txs,
     {InitialVars, _MasterKeys} = blockchain_ct_utils:create_vars(val_vars()),
 
     GenPaymentTxs =
         [ blockchain_txn_coinbase_v1:new(account_address(S, Id), Balance)
-          || {coinbase, Id, Balance} <- Transactions,
-             account_address(S, Id) /= undefined],
+          || {coinbase, Id, Balance} <- Transactions],
 
     InitialConsensusTxn =
         [blockchain_txn_gen_validator_v1:new(validator_address(S, Ctr), account_address(S, Owner), Stake)
@@ -205,14 +205,14 @@ genesis_txs(S, Transactions) ->
     {ok, H} = blockchain:height(S#s.chain),
     H.
 
-genesis_txs_next(S, _Value, [Txs]) ->
+genesis_txs_next(S, _Value, []) ->
     S#s{height = 1,
-        accounts = update_accounts(S, Txs),
+        accounts = update_accounts(S, S#s.txs),
         %% validators = update_validators(S#s.validators, Txs),
-        group = [ Ctr || {validate_stake, Ctr, _, _} <- Txs ],
+        group = [ Ctr || {validate_stake, Ctr, _, _} <- S#s.txs ],
         txs = []}.   %% delete txs from pool
 
-genesis_txs_post(_S, [_], Res) ->
+genesis_txs_post(_S, [], Res) ->
     eq(Res, 1).
 
 
@@ -256,13 +256,15 @@ staked(S) ->
     Staked = blockchain_ledger_v1:query_staked_hnt(Ledger),
     {Staked, Circ, Cool}.
 
-staked_post(S, [], {Staked, _Circ, Cool}) ->
+staked_post(S, [], {Staked, Circ, Cool}) ->
     eqc_statem:conj(
       [eqc_statem:tag(staked, eq(Staked, length(S#s.group) * ?min_stake)),
-       %% eqc_statem:tag(circ, eq(Circ, (?num_accounts * 2 - (length(S#s.group) - ?initial_validators) - NumPends) * ?min_stake,
+       eqc_statem:tag(circ, eq(Circ, (length(S#s.accounts) * 2 * ?min_stake))),
        eqc_statem:tag(cool, eq(Cool, 0 * ?min_stake))   %% actually pending *
       ]).
 
+staked_features(_S, [], {Staked, Circ, Cool}) ->
+    [{cool, Cool}, {staked, Staked}, {circ, Circ}].
 
 
 
