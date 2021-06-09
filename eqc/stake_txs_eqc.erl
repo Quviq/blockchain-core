@@ -26,20 +26,20 @@
 
 -record(s,
         {
-         chain,
-
          used_validators = [],   %% cannot be used again?
          group,   %% validators for those that have stake?
-         validator_idxs = [],
-         account_idxs = [],
-           %% mapping from account to runtime account address and details
-           %% Purposely using a list instead of a map
 
          accounts = [],   %% {index, balance, stake}
          validators = [], %% {index, owner, stake}  probably not needed
          height = 0,
          val_ctr = 0,
-         txs = []   %% abstract transactions to be submitted for next block
+         txs = [],   %% abstract transactions to be submitted for next block
+         chain,
+
+         %% mapping from account to runtime account address and details
+         %% Purposely using a list instead of a map
+         validator_idxs = [],
+         account_idxs = []
         }).
 
 -define(call(Fun, ArgList),
@@ -49,8 +49,6 @@
         {
          owner,
          addr,
-         status,
-         stake,
          sig_fun
         }).
 
@@ -58,9 +56,7 @@
         {
          id,
          address,
-         sig_fun,
-         pub,
-         priv
+         sig_fun
         }).
 
 -define(M, ?MODULE).
@@ -101,14 +97,13 @@ val_vars() ->
 
 %% -- Give commands access to reading the state at runtime -------------------
 
-wrap_call(S, {call, Mod, Cmd, Args}) when
-      Cmd == genesis_txs; Cmd == balances; Cmd == staked ->
-    try {ok, apply(Mod, Cmd, [S | Args])}
-    catch
-        _:Reason:ST -> {error, {'EXIT', {Reason, ST}}, []}
-    end;
-wrap_call(_S, {call, Mod, Cmd, Args}) ->
-    try  {ok, apply(Mod, Cmd, Args)}
+wrap_call(S, {call, Mod, Cmd, Args}) ->
+    WithState = lists:member(Cmd, [genesis_txs, add_block,
+                                   balances, staked,
+                                   tx_transfer, tx_coinbase, tx_consensus]),
+    try if WithState -> {ok, apply(Mod, Cmd, [S | Args])};
+           not WithState -> {ok, apply(Mod, Cmd, Args)}
+        end
     catch
         _:Reason:ST -> {error, {'EXIT', {Reason, ST}}, []}
     end.
@@ -129,67 +124,122 @@ init_chain_next(S, V, [_]) ->
     S#s{chain = V}.
 
 %% --- Operation: create_account ---
-create_account_pre(S) ->
-    S#s.height > 0.
 
 create_account_args(S) ->
     [length(S#s.account_idxs)].
 
 create_account(Id) ->
-    [{Addr, {Pub, Priv, SigFun}}] = test_utils:generate_keys(1),
+    [{Addr, {_, _, SigFun}}] = test_utils:generate_keys(1),
     #account{id = Id,
              address = Addr,
-             sig_fun = SigFun,
-             pub = Pub,
-             priv = Priv}.
+             sig_fun = SigFun}.
 
 create_account_next(S, V, [Id]) ->
     S#s{account_idxs = S#s.account_idxs ++ [{Id, V}]}.
 
 %% --- Operation: validator ---
+
 validator_pre(S) ->
     S#s.account_idxs /= [].
 
 validator_args(S) ->
-    [S#s.val_ctr, elements([Id || {Id, _} <- S#s.account_idxs]), ?min_stake].
+    [S#s.val_ctr, elements([Id || {Id, _} <- S#s.account_idxs])].
 
-validator_pre(S, [_, Owner, _]) ->
+validator_pre(S, [_, Owner]) ->
     lists:keymember(Owner, 1, S#s.account_idxs).
 
-validator(_, Owner, Stake) ->
+validator(_, Owner) ->
     [{Addr, {_Pub, _Priv, SigFun}}] = test_utils:generate_keys(1),
     #validator{owner = Owner,
                addr = Addr,
-               sig_fun = SigFun,
-               stake = Stake}.
+               sig_fun = SigFun}.
 
-validator_next(S, V, [Ctr, Owner, Stake]) ->
+validator_next(S, V, [Ctr, Owner]) ->
     S#s{validator_idxs = S#s.validator_idxs ++ [{Ctr, V, Owner}],
-        txs = S#s.txs ++ [{validate_stake, Ctr, Owner, Stake}],
         val_ctr = Ctr + 1}.
 
 
 %% --- Operation: coinbase ---
-coinbase_pre(S) ->
-    S#s.height == 0
-        andalso length(S#s.account_idxs) =< ?num_accounts.
+tx_coinbase_pre(S) ->
+    S#s.height == 0 andalso S#s.account_idxs /= [].
 
-coinbase_args(S) ->
-    [length(S#s.account_idxs), ?initial_balance].
+tx_coinbase_args(S) ->
+    [elements([Id || {Id, _} <- S#s.account_idxs]), ?initial_balance].
 
-coinbase(Id, _) ->
-    create_account(Id).
+tx_coinbase_pre(S, [Id, _Balance]) ->
+    %% only 1 coinbase Tx per account
+    not lists:keymember(Id, 2, S#s.txs) andalso
+        lists:keymember(Id, 1, S#s.account_idxs).  %% for shrinking
 
-coinbase_next(S, V, [Id, Balance]) ->
-    S1 = create_account_next(S, V, [Id]),
-    S1#s{txs = S1#s.txs ++ [{coinbase, Id, Balance}]}.
+tx_coinbase(S, Id, Balance) ->
+    blockchain_txn_coinbase_v1:new(account_address(S, Id), Balance).
 
+tx_coinbase_next(S, SymbTx, [Id, Balance]) ->
+    S#s{txs = S#s.txs ++ [{coinbase, Id, Balance, SymbTx}]}.
+
+%% --- Operation: tx_validator ---
+tx_consensus_pre(S) ->
+    S#s.validator_idxs /= [].
+
+tx_consensus_args(S) ->
+    ?LET({Ctr,_, Owner}, elements(S#s.validator_idxs),
+         [Ctr, Owner, ?min_stake]).
+
+tx_consensus_pre(S, [Ctr, Owner, _]) ->
+    %% only 1 consensus Tx per validator
+    %% There must be a coinbase for the owner
+    not lists:keymember(Ctr, 2, S#s.txs) andalso
+        [ consensus || {C, _, O} <- S#s.validator_idxs,
+                       C == Ctr andalso O == Owner,
+                       lists:member(Owner, [Id || {coinbase, Id, _, _} <- S#s.txs]) ] /= [].  %% for shrinking
+
+tx_consensus(S, Ctr, Owner, Stake) ->
+    blockchain_txn_gen_validator_v1:new(validator_address(S, Ctr),
+                                        account_address(S, Owner), Stake).
+
+tx_consensus_next(S, SymbTx, [Ctr, Owner, Stake]) ->
+    S#s{txs = S#s.txs ++ [{consensus, Ctr, Owner, Stake, SymbTx}]}.
+
+
+%% --- Operation: transfer ---
+tx_transfer_pre(S) ->
+     S#s.height > 0 andalso S#s.validator_idxs /= [].
+
+tx_transfer_args(S) ->
+    AccountIdxs = [ Id || {Id, _} <- S#s.account_idxs ],
+    ?LET({From, Ctr}, elements([ {Owner, Ctr} || {Ctr, _, Owner} <- S#s.validator_idxs ]),
+         [From, elements(AccountIdxs), choose(0, 40000), Ctr]).
+
+tx_transfer_pre(S, [From, To, _, Validator]) ->
+    lists:keymember(From, 1, S#s.account_idxs) andalso
+        lists:keymember(To, 1, S#s.account_idxs) andalso
+        lists:keymember(Validator, 1, S#s.validator_idxs).
+
+tx_transfer(S, From, To, Amount, Val) ->
+    FromAccount = proplists:get_value(From, S#s.account_idxs),
+    ToAccount = proplists:get_value(To, S#s.account_idxs),
+
+    Txn = blockchain_txn_transfer_validator_stake_v1:new(
+            account_address(FromAccount),
+            validator_address(S, Val),
+            account_address(FromAccount),
+            account_address(ToAccount),
+            ?min_stake,
+            Amount,
+            35000
+           ),
+    STxn0 = blockchain_txn_transfer_validator_stake_v1:sign(Txn, FromAccount#account.sig_fun),
+    blockchain_txn_transfer_validator_stake_v1:new_owner_sign(STxn0, ToAccount#account.sig_fun).
+
+tx_transfer_next(S, SymbTx, [From, To, Amount, Validator]) ->
+    S#s{txs =  S#s.txs ++ [{transfer, From, To, Amount, Validator, SymbTx}]}.
 
 
 %% --- Operation: genesis_txs ---
 genesis_txs_pre(S) ->
-    S#s.chain /= undefined andalso length(S#s.account_idxs) > 0
-        andalso length(S#s.validator_idxs) > 0
+    S#s.chain /= undefined
+        andalso lists:keymember(coinbase, 1, S#s.txs)
+        andalso lists:keymember(consensus, 1, S#s.txs)
         andalso S#s.height == 0.
 
 genesis_txs_args(_S) ->
@@ -200,15 +250,13 @@ genesis_txs(S) ->
     {InitialVars, _MasterKeys} = blockchain_ct_utils:create_vars(val_vars()),
 
     GenPaymentTxs =
-        [ blockchain_txn_coinbase_v1:new(account_address(S, Id), Balance)
-          || {coinbase, Id, Balance} <- Transactions],
+        [ Tx || {coinbase, _, _, Tx} <- Transactions],
 
     InitialConsensusTxn =
-        [blockchain_txn_gen_validator_v1:new(validator_address(S, Ctr), account_address(S, Owner), Stake)
-         || {validate_stake, Ctr, Owner, Stake} <- Transactions ],
+        [Tx || {consensus, _Ctr, _Owner, _Stake, Tx} <- Transactions ],
 
     GenConsensusGroupTx = blockchain_txn_consensus_group_v1:new(
-                           [ validator_address(S, Ctr) || {validate_stake, Ctr, _, _} <- Transactions],
+                           [ validator_address(S, Ctr) || {consensus, Ctr, _, _, _} <- Transactions],
                             <<"proof">>, 1, 0),
 
     Txs = InitialVars ++
@@ -224,50 +272,82 @@ genesis_txs(S) ->
 genesis_txs_next(S, _Value, []) ->
     S#s{height = 1,
         accounts = update_accounts(S, S#s.txs),
-        %% validators = update_validators(S#s.validators, Txs),
-        group = [ Ctr || {validate_stake, Ctr, _, _} <- S#s.txs ],
+        used_validators = [ Ctr || {consensus, Ctr, _, _, _} <- S#s.txs ],
+        group = [ Ctr || {consensus, Ctr, _, _, _} <- S#s.txs ],
         txs = []}.   %% delete txs from pool
 
 genesis_txs_post(_S, [], Res) ->
     eq(Res, 1).
 
+%% --- Operation: genesis_txs ---
+add_block_pre(S) ->
+    S#s.height > 0 andalso S#s.group /= []. %% andalso S#s.txs /= [].
 
-%% --- Operation: transfer ---
-transfer_pre(S) ->
-    false andalso S#s.height > 0 andalso S#s.validator_idxs /= [].
+add_block_args(_S) ->
+    [].
 
-transfer_args(S) ->
-    AccountIdxs = [ Id || {Id, _} <- S#s.account_idxs ],
-    ?LET({From, Ctr}, elements([ {Owner, Ctr} || {Ctr, _, Owner} <- S#s.validator_idxs ]),
-         [From, elements(AccountIdxs), choose(0, 40000), Ctr]).
+add_block(S) ->
+    Chain = S#s.chain,
+    Transactions =  [ lists:last(tuple_to_list(Tx)) || Tx <- S#s.txs ],
 
-transfer_pre(S, [From, To, _, Validator]) ->
-    lists:keymember(From, 1, S#s.account_idxs) andalso
-        lists:keymember(To, 1, S#s.account_idxs) andalso
-        lists:keymember(Validator, 1, S#s.validator_idxs).
+    STxns = lists:sort(fun blockchain_txn:sort/2, Transactions),
+    io:format("Transactions to validate to block: ~p\n", [STxns]),
+    {Valid, _Invalid} = blockchain_txn:validate(STxns, Chain),
 
-transfer(S, From, To, Amount, Val) ->
-    FromAccount = proplists:get_value(From, S#s.account_idxs),
-    ToAccount = proplists:get_value(To, S#s.account_idxs),
+    {ok, HeadBlock} = blockchain:head_block(Chain),
+    {ok, PrevHash} = blockchain:head_hash(Chain),
+    Height = blockchain_block:height(HeadBlock) + 1,
+    Time = blockchain_block:time(HeadBlock) + 1,
+    MBlock =
+        #{prev_hash => PrevHash,
+          height => Height,
+          transactions => Valid,
+          signatures => [],
+          time => Time,
+          hbbft_round => 0,
+          election_epoch => 1,
+          epoch_start => 0,
+          seen_votes => [],
+          bba_completion => <<>>
+         },
+    io:format("Mblock ~p\n", [MBlock]),
+    Block0 = blockchain_block_v1:new(MBlock),
+    BinBlock = blockchain_block:serialize(Block0),
+    Group = [ Val || {Id, Val, _} <- S#s.validator_idxs,
+                     lists:member(Id, S#s.group)],
+    Signatures = [ {Addr, Sign(BinBlock)} || #validator{addr = Addr, sig_fun = Sign} <- Group ],
+    io:format("Signatures ~p\n", [Signatures]),
+    Block1 = blockchain_block:set_signatures(Block0, Signatures),
+    io:format("Block1 ~p\n", [Block1]),
+    ok = blockchain:add_block(Block1, Chain),
+    {ok, H} = blockchain:height(S#s.chain),
+    {H, Valid}.
 
-    Txn = blockchain_txn_transfer_validator_stake_v1:new(
-            account_address(ToAccount), account_address(FromAccount),
-            validator_address(S, Val),
-            account_address(FromAccount),
-            account_address(ToAccount),
-            ?min_stake,
-            Amount,
-            35000
-           ),
-    STxn0 = blockchain_txn_transfer_validator_stake_v1:sign(Txn, FromAccount#account.sig_fun),
-    blockchain_txn_transfer_validator_stake_v1:new_owner_sign(STxn0, ToAccount#account.sig_fun).
 
-transfer_next(S, _Value, []) ->
-    S.
+add_block_next(S, _Value, []) ->
+    S#s{height = S#s.height + 1,
+        accounts = update_accounts(S, S#s.txs),
+        %% validators = update_validators(S#s.validators, Txs),
+        txs = []}.   %% delete txs from pool
 
-transfer_post(_S, [], _Res) ->
-    true.
+add_block_post(S, [], {Height, ValidTxs}) ->
+    WronglyRejected = [ Tx || Tx <- S#s.txs,
+                              not lists:member(element(size(Tx), Tx), ValidTxs),
+                              is_valid(S, Tx)],
+    eqc_statem:conj(
+      [ eqc_statem:tag(height, eq(Height, S#s.height + 1)),
+        eqc_statem:tag(invalid_accepted, ValidTxs == []),
+        eqc_statem:tag(valid_reject,  eq(WronglyRejected, [])) ]).
 
+
+is_valid(S, {transfer, From, To, Amount, Validator, _}) ->
+    case lists:keyfind(From, 1, S#s.accounts) of
+        {_, Balance, _Stake} ->
+            Balance > Amount + 35000;
+         false -> false
+    end andalso lists:keymember(To, 1, S#s.account_idxs)
+        andalso lists:keymember(Validator, 1, S#s.validator_idxs)
+        andalso not lists:member(Validator, S#s.used_validators).
 
 
 %% --- Operation: balance ---
@@ -352,7 +432,7 @@ prop_stake_txs() ->
 
            measure(height, S#s.height,
            aggregate(command_names(Cmds),
-           aggregate(with_title("abstract transactions"), S#s.txs,
+           aggregate(with_title("abstract transactions"), [ abstract(Tx) || Tx <- S#s.txs],
            aggregate(call_features(H),
            features(call_features(H),
            eqc_statem:pretty_commands(?M,
@@ -374,6 +454,14 @@ validator_address(S, Ctr) ->
 validator_address(#validator{addr = Addr}) ->
     Addr.
 
+get_validator(S, Ctr) ->
+    case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
+        {_, Val, _} ->
+            Val;
+        _ ->
+            undefined
+    end.
+
 account_address(#account{address = Addr}) ->
     Addr.
 
@@ -387,7 +475,7 @@ account_address(S, Id) ->
 
 update_accounts(S, []) ->
     S#s.accounts;
-update_accounts(S, [{coinbase, Id, Balance} | Txs]) ->
+update_accounts(S, [{coinbase, Id, Balance, _} | Txs]) ->
     case {lists:keyfind(Id, 1, S#s.account_idxs), lists:keyfind(Id, 1, S#s.accounts)} of
         {false, _} ->
             update_accounts(S, Txs);
@@ -397,7 +485,7 @@ update_accounts(S, [{coinbase, Id, Balance} | Txs]) ->
         {_, false} ->
             update_accounts(S#s{accounts = S#s.accounts ++ [{Id, Balance, 0}]}, Txs)
     end;
-update_accounts(S, [{validator_stake, _Ctr, Id, Stake} | Txs]) ->
+update_accounts(S, [{consensus, _Ctr, Id, Stake, _} | Txs]) ->
     case {lists:keyfind(Id, 1, S#s.account_idxs), lists:keyfind(Id, 1, S#s.accounts)} of
         {false, _} ->
             update_accounts(S, Txs);
@@ -409,3 +497,10 @@ update_accounts(S, [{validator_stake, _Ctr, Id, Stake} | Txs]) ->
     end;
 update_accounts(S, [_ | Txs]) ->
     update_accounts(S, Txs).
+
+abstract({consensus, Id, Account, Stake, _}) ->
+    {consensus, Id, Account, Stake};
+abstract({coinbase, Account, Balance, _}) ->
+    {coinbase, Account, Balance};
+abstract(Tx) ->
+    Tx.
