@@ -27,7 +27,7 @@
 -record(s,
         {
          used_validators = [],   %% cannot be used again?
-         group,   %% validators for those that have stake?
+         group = [],   %% validators for those that have stake?
 
          accounts = [],   %% {index, balance, stake}
          validators = [], %% {index, owner, stake}  probably not needed
@@ -61,7 +61,7 @@
 
 -define(M, ?MODULE).
 -define(num_accounts, 5).
--define(initial_validators, 4).
+-define(initial_validators, 4).  %% Not that this is also ?num_consensus_members
 -define(min_stake, ?bones(10000)).
 -define(initial_balance, ?min_stake * 2).
 
@@ -161,44 +161,45 @@ validator_next(S, V, [Ctr, Owner]) ->
 
 %% --- Operation: coinbase ---
 tx_coinbase_pre(S) ->
-    S#s.height == 0 andalso S#s.account_idxs /= [].
+    S#s.height == 0 andalso unused_accounts(S) /= [].
 
+%% only 1 coinbase Tx per account
 tx_coinbase_args(S) ->
-    [elements([Id || {Id, _} <- S#s.account_idxs]), ?initial_balance].
+    [elements(unused_accounts(S)), ?initial_balance].
 
 tx_coinbase_pre(S, [Id, _Balance]) ->
-    %% only 1 coinbase Tx per account
-    not lists:keymember(Id, 2, S#s.txs) andalso
-        lists:keymember(Id, 1, S#s.account_idxs).  %% for shrinking
+    lists:member(Id, unused_accounts(S)).  %% for shrinking
 
 tx_coinbase(S, Id, Balance) ->
     blockchain_txn_coinbase_v1:new(account_address(S, Id), Balance).
 
 tx_coinbase_next(S, SymbTx, [Id, Balance]) ->
-    S#s{txs = S#s.txs ++ [{coinbase, Id, Balance, SymbTx}]}.
+    S#s{txs = S#s.txs ++ [#{kind => coinbase, account => Id, balance => Balance, sym => SymbTx}]}.
 
-%% --- Operation: tx_validator ---
+%% --- Operation: tx_consensus ---
 tx_consensus_pre(S) ->
-    S#s.validator_idxs /= [].
+    S#s.height == 0 andalso
+        unused_validators(S) /= [] andalso
+        nr_txs(S, consensus) =< ?initial_validators.
 
 tx_consensus_args(S) ->
-    ?LET({Ctr,_, Owner}, elements(S#s.validator_idxs),
-         [Ctr, Owner, ?min_stake]).
+    ?LET(Ctr, elements(unused_validators(S)),
+         [Ctr, validator_owner(S, Ctr), ?min_stake]).
 
 tx_consensus_pre(S, [Ctr, Owner, _]) ->
     %% only 1 consensus Tx per validator
     %% There must be a coinbase for the owner
-    not lists:keymember(Ctr, 2, S#s.txs) andalso
+    lists:member(Ctr, unused_validators(S)) andalso
         [ consensus || {C, _, O} <- S#s.validator_idxs,
                        C == Ctr andalso O == Owner,
-                       lists:member(Owner, [Id || {coinbase, Id, _, _} <- S#s.txs]) ] /= [].  %% for shrinking
+                       lists:member(Owner, [Id || #{kind := coinbase, account := Id} <- S#s.txs]) ] /= [].  %% for shrinking
 
 tx_consensus(S, Ctr, Owner, Stake) ->
     blockchain_txn_gen_validator_v1:new(validator_address(S, Ctr),
                                         account_address(S, Owner), Stake).
 
 tx_consensus_next(S, SymbTx, [Ctr, Owner, Stake]) ->
-    S#s{txs = S#s.txs ++ [{consensus, Ctr, Owner, Stake, SymbTx}]}.
+    S#s{txs = S#s.txs ++ [#{kind => consensus, validator => Ctr, account => Owner, stake => Stake, sym => SymbTx}]}.
 
 
 %% --- Operation: transfer ---
@@ -238,8 +239,8 @@ tx_transfer_next(S, SymbTx, [From, To, Amount, Validator]) ->
 %% --- Operation: genesis_txs ---
 genesis_txs_pre(S) ->
     S#s.chain /= undefined
-        andalso lists:keymember(coinbase, 1, S#s.txs)
-        andalso lists:keymember(consensus, 1, S#s.txs)
+        andalso nr_txs(S, coinbase) > 0
+        andalso nr_txs(S, consensus) == ?initial_validators
         andalso S#s.height == 0.
 
 genesis_txs_args(_S) ->
@@ -250,13 +251,13 @@ genesis_txs(S) ->
     {InitialVars, _MasterKeys} = blockchain_ct_utils:create_vars(val_vars()),
 
     GenPaymentTxs =
-        [ Tx || {coinbase, _, _, Tx} <- Transactions],
+        [ Tx || #{kind := coinbase, sym := Tx} <- Transactions],
 
     InitialConsensusTxn =
-        [Tx || {consensus, _Ctr, _Owner, _Stake, Tx} <- Transactions ],
+        [Tx || #{kind := consensus, sym := Tx} <- Transactions ],
 
     GenConsensusGroupTx = blockchain_txn_consensus_group_v1:new(
-                           [ validator_address(S, Ctr) || {consensus, Ctr, _, _, _} <- Transactions],
+                           [ validator_address(S, Ctr) || #{kind := consensus, validator := Ctr} <- Transactions],
                             <<"proof">>, 1, 0),
 
     Txs = InitialVars ++
@@ -272,8 +273,8 @@ genesis_txs(S) ->
 genesis_txs_next(S, _Value, []) ->
     S#s{height = 1,
         accounts = update_accounts(S, S#s.txs),
-        used_validators = [ Ctr || {consensus, Ctr, _, _, _} <- S#s.txs ],
-        group = [ Ctr || {consensus, Ctr, _, _, _} <- S#s.txs ],
+        used_validators = [ Ctr || #{kind := consensus, validator := Ctr} <- S#s.txs ],
+        group = [ Ctr || #{kind := consensus, validator := Ctr} <- S#s.txs ],
         txs = []}.   %% delete txs from pool
 
 genesis_txs_post(_S, [], Res) ->
@@ -346,24 +347,26 @@ is_valid(S, {transfer, From, To, Amount, Validator, _}) ->
             Balance > Amount + 35000;
          false -> false
     end andalso lists:keymember(To, 1, S#s.account_idxs)
-        andalso lists:keymember(Validator, 1, S#s.validator_idxs)
-        andalso not lists:member(Validator, S#s.used_validators).
+        andalso lists:member(Validator, unused_validators(S)).
 
+%% Observational operations ---------------------------------------------------
 
 %% --- Operation: balance ---
 balances_pre(S) ->
     S#s.height > 0.
 
 balances_args(S) ->
-    [[ Id || {Id, _, _} <- S#s.accounts ]].
+    [sublist([ Id || {Id, _, _} <- S#s.accounts ])].
 
 balances(S, Ids) ->
     Ledger = blockchain:ledger(S#s.chain),
     [ case account_address(S, Id) of
           undefined -> {Id, undefined};
           Address ->
-              {ok, Ent} = blockchain_ledger_v1:find_entry(Address, Ledger),
-              {Id, blockchain_ledger_entry_v1:balance(Ent)}
+              {Id, case blockchain_ledger_v1:find_entry(Address, Ledger) of
+                       {ok, Ent} -> blockchain_ledger_entry_v1:balance(Ent);
+                       _ -> undefined
+                   end}
       end || Id <- Ids ].
 
 balances_post(S, [_Ids], Res) ->
@@ -404,6 +407,29 @@ staked_features(_S, [], {Staked, Circ, Cool}) ->
 
 %%% ----------------------------------------
 
+weight(S, validator) ->
+    if length(S#s.validator_idxs) - length(S#s.used_validators) < ?initial_validators -> 20;
+       true -> 1
+    end;
+weight(S, tx_coinbase) ->
+    NrTxs = nr_txs(S, coinbase),
+    if NrTxs < 2 -> 10;
+       true -> 1
+    end;
+weight(S, tx_consensus) ->
+    NrTxs = nr_txs(S, consensus),
+    if NrTxs < ?initial_validators -> 20;
+       true -> 10
+    end;
+weight(S, tx_stake) ->
+    NrTxs = nr_txs(S, stake),
+    if S#s.height == 0 -> 0;
+        NrTxs < ?initial_validators -> 20;
+       NrTxs > 5 -> 1;
+       true -> 2
+    end;
+weight(_, _) ->
+    1.
 
 
 %% -- Property ---------------------------------------------------------------
@@ -451,6 +477,14 @@ validator_address(S, Ctr) ->
             undefined
     end.
 
+validator_owner(S, Ctr) ->
+    case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
+        {_, _, Owner} ->
+            Owner;
+        _ ->
+            undefined
+    end.
+
 validator_address(#validator{addr = Addr}) ->
     Addr.
 
@@ -475,7 +509,7 @@ account_address(S, Id) ->
 
 update_accounts(S, []) ->
     S#s.accounts;
-update_accounts(S, [{coinbase, Id, Balance, _} | Txs]) ->
+update_accounts(S, [#{kind := coinbase, account := Id, balance := Balance} | Txs]) ->
     case {lists:keyfind(Id, 1, S#s.account_idxs), lists:keyfind(Id, 1, S#s.accounts)} of
         {false, _} ->
             update_accounts(S, Txs);
@@ -485,7 +519,7 @@ update_accounts(S, [{coinbase, Id, Balance, _} | Txs]) ->
         {_, false} ->
             update_accounts(S#s{accounts = S#s.accounts ++ [{Id, Balance, 0}]}, Txs)
     end;
-update_accounts(S, [{consensus, _Ctr, Id, Stake, _} | Txs]) ->
+update_accounts(S, [#{kind := consensus, account := Id, stake := Stake} | Txs]) ->
     case {lists:keyfind(Id, 1, S#s.account_idxs), lists:keyfind(Id, 1, S#s.accounts)} of
         {false, _} ->
             update_accounts(S, Txs);
@@ -504,3 +538,14 @@ abstract({coinbase, Account, Balance, _}) ->
     {coinbase, Account, Balance};
 abstract(Tx) ->
     Tx.
+
+nr_txs(S, Kind) ->
+  length([K || #{kind := K} <- S#s.txs, K == Kind]).
+
+unused_accounts(S) ->
+    [ Id || {Id, _} <- S#s.account_idxs ] --
+        [maps:get(account, Tx) || Tx <- S#s.txs, maps:get(kind, Tx) == coinbase].
+
+unused_validators(S) ->
+    [ Id || {Id, _, _} <- S#s.validator_idxs ] --
+        ([maps:get(validator, Tx) || #{kind := consensus} = Tx <- S#s.txs ] ++ S#s.group).
