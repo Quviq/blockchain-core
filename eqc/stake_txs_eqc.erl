@@ -39,6 +39,7 @@
          unstaked = [],
          transferred = [],
          accounts = [],   %% {index, balance, stake}
+         void = [],  %% void validators, cannot be used again
 
          height = 0,
          val_ctr = 0,
@@ -107,8 +108,9 @@ val_vars() ->
 
 wrap_call(S, {call, Mod, Cmd, Args}) ->
     WithState = lists:member(Cmd, [genesis_txs, add_block,
-                                   balances, staked,
-                                   tx_transfer, tx_coinbase, tx_consensus, tx_stake]),
+                                   balances, stakes,
+                                   tx_transfer, tx_coinbase, tx_consensus,
+                                   tx_stake, tx_unstake]),
     try if WithState -> {ok, apply(Mod, Cmd, [S | Args])};
            not WithState -> {ok, apply(Mod, Cmd, Args)}
         end
@@ -184,7 +186,7 @@ tx_coinbase_pre(S) ->
 
 %% only 1 coinbase Tx per account
 tx_coinbase_args(S) ->
-    [elements(unused_accounts(S)), ?initial_balance].
+    [elements(unused_accounts(S)), choose(?initial_balance, 2 * ?initial_balance)].
 
 tx_coinbase_pre(S, [Id, _Balance]) ->
     lists:member(Id, unused_accounts(S)).  %% for shrinking
@@ -204,7 +206,7 @@ tx_consensus_pre(S) ->
 
 tx_consensus_args(S) ->
     ?LET(Ctr, elements(unused_validators(S)),
-         [Ctr, validator_owner(S, Ctr), ?min_stake + 1]).
+         [Ctr, validator_owner(S, Ctr), ?min_stake + 3]).
 
 tx_consensus_pre(S, [Ctr, Owner, _]) ->
     %% only 1 consensus Tx per validator
@@ -226,6 +228,8 @@ tx_consensus_next(S, SymbTx, [Ctr, Owner, Stake]) ->
         staked = S#s.staked ++ [ {Ctr, Stake} ]}.
 
 %% --- Operation: stake ---
+%% Moving balance to stake
+
 tx_stake_pre(S) ->
     S#s.height > 0 andalso
         unused_validators(S) /= [].
@@ -244,7 +248,7 @@ tx_stake_valid(S, [Ctr, Owner, Stake]) ->
         [ account || {C, _, O} <- S#s.validator_idxs,
                      C == Ctr andalso O == Owner,
                      case lists:keyfind(Owner, 1, S#s.accounts) of
-                         {_, _, HasStake} -> HasStake >= Stake;
+                         {_, Balance, _} -> Balance >= Stake;
                          _ -> false
                      end] /= [].  %% for shrinking
 
@@ -261,10 +265,50 @@ tx_stake(S, Ctr, Owner, Stake) ->
 tx_stake_next(S, SymbTx, [Ctr, Owner, Stake]) ->
     {Owner, B, Stk} = lists:keyfind(Owner, 1, S#s.accounts),
     S#s{txs = S#s.txs ++ [#{kind => stake, validator => Ctr, account => Owner, stake => Stake, sym => SymbTx}],
-        accounts = lists:keyreplace(Owner, 1, S#s.accounts, {Owner, B, Stake - Stk}),
+        accounts = lists:keyreplace(Owner, 1, S#s.accounts, {Owner, B - Stake, Stk + Stake}),
         staked = S#s.staked ++ [{Ctr, Stake}]}.
 
+%% --- Operation: unstake ---
+%% Moving balance from stake at future height
 
+tx_unstake_pre(S) ->
+    S#s.height > 0 andalso
+       S#s.staked /= [].
+
+tx_unstake_args(S) ->
+    ?LET({Ctr, Stake}, elements(S#s.staked),
+         [Ctr, validator_owner(S, Ctr), Stake, choose(maps:get( ?stake_withdrawal_cooldown, val_vars()), 5)]).
+
+tx_unstake_pre(S, [Ctr, Owner, Stake, DeltaHeight]) ->
+    tx_unstake_valid(smap(S), [Ctr, Owner, Stake, DeltaHeight]).
+
+tx_unstake_valid(#{staked := Staked, group := Group, unstaked := Unstaked, accounts := Accounts},
+                 [Ctr, Owner, _Stake, DeltaHeight]) ->
+    lists:member(Ctr, [Id || {Id, _} <- Staked, not lists:member(Id, Group)]) andalso
+        not lists:keymember(Ctr, 1, Unstaked) andalso
+        lists:keymember(Owner, 1, Accounts) andalso
+        DeltaHeight > 0.
+
+tx_unstake(S, Ctr, Owner, Stake, DeltaHeight) ->
+    Val = get_validator(S, Ctr),
+    Account = get_account(S, Owner),
+    Txn = blockchain_txn_unstake_validator_v1:new(
+            Val#validator.addr, Account#account.address,
+            Stake,
+            S#s.height + DeltaHeight,
+            35000
+           ),
+    blockchain_txn_unstake_validator_v1:sign(Txn, Account#account.sig_fun).
+
+tx_unstake_next(S, SymbTx, [Ctr, Owner, Stake, DeltaHeight]) ->
+    S#s{txs = S#s.txs ++ [#{kind => unstake, validator => Ctr, account => Owner, height => S#s.height + DeltaHeight, sym => SymbTx}],
+        %% receive at height! accounts = lists:keyreplace(Owner, 1, S#s.accounts, {Owner, B - Stake, Stk}),
+        unstaked = S#s.unstaked ++ [{Ctr, Stake, S#s.height + DeltaHeight}],
+        void = S#s.void ++ [Ctr]}.   %% the next block handles this Tx
+
+%% Oh dear,
+%% if I unstake in block 2, (then my height+DeltaHeight is actually 6)
+%%     then I see effect already in block 6!! That's one too early!
 
 
 %% --- Operation: genesis_txs ---
@@ -306,6 +350,7 @@ genesis_txs_next(S, _Value, []) ->
         chain_accounts = S#s.accounts,
         chain_group = S#s.group,
         chain_staked = S#s.staked,
+        void = S#s.group,
         txs = []}.   %% delete txs from pool
 
 genesis_txs_post(_S, [], Res) ->
@@ -315,15 +360,15 @@ genesis_txs_post(_S, [], Res) ->
 add_block_pre(S) ->
     S#s.height > 0 andalso S#s.group /= []. %% andalso S#s.txs /= [].
 
-%% add_block_args(_S) ->
-%%     [].
+add_block_args(_S) ->
+    [].
 
 add_block(S) ->
     Chain = S#s.chain,
     Transactions =  [ Tx || #{sym := Tx} <- S#s.txs ],
 
     STxns = lists:sort(fun blockchain_txn:sort/2, Transactions),
-    io:format("Transactions to validate to block: ~p\n", [STxns]),
+    %% io:format("Transactions to validate to block: ~p\n", [STxns]),
     {Valid, _Invalid} = blockchain_txn:validate(STxns, Chain),
 
     {ok, HeadBlock} = blockchain:head_block(Chain),
@@ -342,44 +387,53 @@ add_block(S) ->
           seen_votes => [],
           bba_completion => <<>>
          },
-    io:format("Mblock ~p\n", [MBlock]),
     Block0 = blockchain_block_v1:new(MBlock),
     BinBlock = blockchain_block:serialize(Block0),
     Group = [ Val || {Id, Val, _} <- S#s.validator_idxs,
                      lists:member(Id, S#s.group)],
     Signatures = [ {Addr, Sign(BinBlock)} || #validator{addr = Addr, sig_fun = Sign} <- Group ],
-    io:format("Signatures ~p\n", [Signatures]),
     Block1 = blockchain_block:set_signatures(Block0, Signatures),
-    io:format("Block1 ~p\n", [Block1]),
     ok = blockchain:add_block(Block1, Chain),
     {ok, H} = blockchain:height(S#s.chain),
     {H, Valid}.
 
 
-add_block_next(S, _Value, []) ->
-    S#s{height = S#s.height + 1,
-        chain_accounts = S#s.accounts,
+add_block_next(S0, _Value, []) ->
+    S = adapt_height(S0, S0#s.height + 1),
+    S#s{chain_accounts = S#s.accounts,
         chain_staked = S#s.staked,
-        txs = []}.   %% delete txs from pool
+        chain_unstaked = S#s.unstaked,
+        txs = []}.
 
-add_block_post(S, [], {Height, ValidTxs}) ->
-    WronglyRejected = [ Tx || #{sym := Txn} = Tx <- S#s.txs,
-                              not lists:member(Txn, ValidTxs),
-                              is_valid(S, Tx)],
-    ValidTxns =  [ Txn || #{sym := Txn} = Tx <- S#s.txs, is_valid(S, Tx)],
+add_block_post(S, [], {Height, AcceptedTxs}) ->
+    ModelValidTxs = valid_txs(S),
+    WronglyRejected = [ Tx || #{sym := Txn} = Tx <- ModelValidTxs,
+                              not lists:member(Txn, AcceptedTxs)],
+    ValidTxns =  [ Txn || #{sym := Txn} <- ModelValidTxs],
     eqc_statem:conj(
       [ eqc_statem:tag(height, eq(Height, S#s.height + 1)),
-        eqc_statem:tag(invalid_accepted, eq(ValidTxs -- ValidTxns, [])),
-        eqc_statem:tag(valid_reject,  eq(WronglyRejected, [])) ]).
+        eqc_statem:tag(invalid_accepted, eq(AcceptedTxs -- ValidTxns, [])),
+        eqc_statem:tag(valid_reject, eq(WronglyRejected, [])) ]).
 
 
-is_valid(S, #{kind := transfer, account := From, account := To, amount := Amount, validator := Validator}) ->
-    case lists:keyfind(From, 1, S#s.accounts) of
-        {_, Balance, _Stake} ->
-            Balance > Amount + 35000;
-         false -> false
-    end andalso lists:keymember(To, 1, S#s.account_idxs)
-        andalso lists:member(Validator, unused_validators(S));
+valid_txs(S) ->
+    {_, Txs} =
+        lists:foldl(fun(Tx, {NS, Acc}) ->
+                            %% here we need a nice mechanism for state update
+                            case is_valid(NS, Tx) of
+                                true -> {NS, [Tx | Acc]};
+                                false -> {NS, Acc}
+                            end
+                    end, {S, []}, S#s.txs),
+    Txs.
+
+%% is_valid(S, #{kind := transfer, account := From, account := To, amount := Amount, validator := Validator}) ->
+%%     case lists:keyfind(From, 1, S#s.accounts) of
+%%         {_, Balance, _Stake} ->
+%%             Balance > Amount + 35000;
+%%          false -> false
+%%     end andalso lists:keymember(To, 1, S#s.account_idxs)
+%%         andalso lists:member(Validator, unused_validators(S));
 is_valid(_S, _) ->
     %% cannot use precondition (or valid) when creating stake, because now added to txs and hence no longer unused validator
     true.
@@ -410,38 +464,36 @@ balances_post(S, [_Ids], Res) ->
             {_, Balance, _} ->
                 eq(RealBalance, Balance);
             _ ->
-                false
+                eq(RealBalance, undefined)
         end || {Id, RealBalance} <- Res ]).
 
 
 %% --- Operation: staked ---
-staked_pre(S) ->
+stakes_pre(S) ->
     S#s.height > 0.
 
-staked_args(_S) ->
+stakes_args(_S) ->
     [].
 
-staked(S) ->
+stakes(S) ->
     Ledger = blockchain:ledger(S#s.chain),
     Circ = blockchain_ledger_v1:query_circulating_hnt(Ledger),
     Cool = blockchain_ledger_v1:query_cooldown_hnt(Ledger),
     Staked = blockchain_ledger_v1:query_staked_hnt(Ledger),
     {Staked, Circ, Cool}.
 
-staked_post(S, [], {Staked, Circ, Cool}) ->
-    ModelStaked = lists:sum([Stk || {_, Stk} <- S#s.chain_staked]),
+stakes_post(S, [], {Staked, Circ, Cool}) ->
+    ModelUnstaked = lists:sum([Stk || {_, Stk, _} <- S#s.chain_unstaked ]),
+    ModelStaked = lists:sum([Stk || {_, Stk} <- S#s.chain_staked]) - ModelUnstaked,
+    ModelTotalBalance = lists:sum([B || {_, B, _Stk} <- S#s.chain_accounts]),
     eqc_statem:conj(
-      [eqc_statem:tag(staked, eq(Staked, ModelStaked)),
-       %% eqc_statem:tag(circ, eq(Circ, lists:sum([ Stk || {_, _, Stk} <- S#s.chain_accounts]))),
-       eqc_statem:tag(circ1, eq(Circ, 2 * length(S#s.chain_accounts) * ?min_stake)),
-       eqc_statem:tag(cool, eq(Cool, 0 * ?min_stake))   %% actually pending *
+      [eqc_statem:tag(staked, eq(Staked, ModelStaked)),  %% Staked in group ??
+       eqc_statem:tag(circ, eq(Circ, ModelTotalBalance)),
+       eqc_statem:tag(cool, eq(Cool, lists:sum([Stk || {_, Stk, _} <- S#s.chain_unstaked])))
       ]).
 
-%% (?num_accounts * 2 - (NumVals - ?initial_validators) - NumPends) * Stake,
-
-staked_features(_S, [], {Staked, Circ, Cool}) ->
-    [{cool, Cool}, {staked, Staked}, {circ, Circ}].
-
+stakes_features(_S, [], {Staked, _Circ, Cool}) ->
+    [cool || Cool > 0] ++ [ staked || Staked > 0].
 
 
 %%% ----------------------------------------
@@ -507,7 +559,7 @@ prop_stake_txs() ->
 
            measure(height, S#s.height,
            aggregate(command_names(Cmds),
-           aggregate(with_title("abstract transactions"), [ maps:without([sym], Tx) || Tx <- S#s.txs],
+           aggregate(with_title("abstract transactions"), [ Kind || #{kind := Kind} <- S#s.txs],
            aggregate(call_features(H),
            features(call_features(H),
            eqc_statem:pretty_commands(?M,
@@ -559,31 +611,6 @@ account_address(S, Id) ->
             undefined
     end.
 
-update_accounts(S, []) ->
-    S#s.accounts;
-update_accounts(S, [#{kind := coinbase, account := Id, balance := Balance} | Txs]) ->
-    case {lists:keyfind(Id, 1, S#s.account_idxs), lists:keyfind(Id, 1, S#s.accounts)} of
-        {false, _} ->
-            update_accounts(S, Txs);
-        {_, {_, B, Stk}} ->
-            NewAccounts = lists:keyreplace(Id, 1, S#s.accounts, {Id, B + Balance, Stk}),
-            update_accounts(S#s{accounts = NewAccounts}, Txs);
-        {_, false} ->
-            update_accounts(S#s{accounts = S#s.accounts ++ [{Id, Balance, 0}]}, Txs)
-    end;
-update_accounts(S, [#{kind := consensus, account := Id, stake := Stake} | Txs]) ->
-    case {lists:keyfind(Id, 1, S#s.account_idxs), lists:keyfind(Id, 1, S#s.accounts)} of
-        {false, _} ->
-            update_accounts(S, Txs);
-        {_, {_, B, Stk}} ->
-            NewAccounts = lists:keyreplace(Id, 1, S#s.accounts, {Id, B, Stake + Stk}),
-            update_accounts(S#s{accounts = NewAccounts}, Txs);
-        {_, false} ->
-            update_accounts(S#s{accounts = S#s.accounts ++ [{Id, 0, Stake}]}, Txs)
-    end;
-update_accounts(S, [_ | Txs]) ->
-    update_accounts(S, Txs).
-
 
 nr_txs(S, Kind) ->
   length([K || #{kind := K} <- S#s.txs, K == Kind]).
@@ -593,4 +620,26 @@ unused_accounts(S) ->
 
 unused_validators(S) ->
     [ Id || {Id, _, _} <- S#s.validator_idxs ] --
-        (S#s.group ++ S#s.staked ++ S#s.unstaked ++ S#s.transferred).
+        (S#s.void ++ S#s.transferred ++ [ Ctr || {Ctr, _} <- S#s.staked ]).
+
+smap(S) ->
+    #{staked => S#s.staked, unstaked => S#s.unstaked, tranferred => S#s.transferred,
+      group => S#s.group, accounts => S#s.accounts}.
+
+chainmap(S) ->
+    #{staked => S#s.chain_staked, unstaked => S#s.chain_unstaked, tranferred => S#s.chain_transferred,
+      group => S#s.chain_group, accounts => S#s.chain_accounts}.
+
+adapt_height(S, Height) ->
+    ReleaseStake = [ {Ctr, Stk, validator_owner(S, Ctr)}
+                     || {Ctr, Stk, H} <- S#s.unstaked,
+                        H =< Height ],
+    S#s{height = Height,
+        staked = [ {Ctr, Stk} || {Ctr, Stk} <- S#s.staked,
+                                 not lists:keymember(Ctr, 1, ReleaseStake)],
+        unstaked = [ {Ctr, Stk, H} || {Ctr, Stk, H} <- S#s.unstaked,
+                                      not lists:keymember(Ctr, 1, ReleaseStake) ],
+        accounts = lists:foldl(fun({_, Stk, Owner}, Accounts) ->
+                                       {Id, B, Stake} = lists:keyfind(Owner, 1, Accounts),
+                                       lists:keyreplace(Owner, 1, Accounts, {Id, B + Stk, Stake - Stk})
+                               end, S#s.accounts, ReleaseStake)}.
