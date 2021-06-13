@@ -210,8 +210,10 @@ tx_consensus_pre(S, [Ctr, Owner, _]) ->
         lists:keymember(Owner, 1, S#s.accounts).
 
 tx_consensus(S, Ctr, Owner, Stake) ->
-    blockchain_txn_gen_validator_v1:new(validator_address(S, Ctr),
-                                        account_address(S, Owner), Stake).
+    Val = get_validator(S, Ctr),
+    Account = get_account(S, Owner),
+    blockchain_txn_gen_validator_v1:new(Val#validator.addr,
+                                        Account#account.address, Stake).
 
 tx_consensus_next(S, SymbTx, [Ctr, Owner, Stake]) ->
     {Owner, B, Stk} = lists:keyfind(Owner, 1, S#s.accounts),
@@ -612,12 +614,8 @@ prop_stake_txs() ->
 %%% helpers
 
 validator_address(S, Ctr) ->
-    case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
-        {_, #validator{addr = Addr}} ->
-            Addr;
-        _ ->
-            undefined
-    end.
+    Val = get_validator(S, Ctr),
+    Val#validator.addr.
 
 get_validator(S, Ctr) ->
     case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
