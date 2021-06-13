@@ -56,7 +56,6 @@
 
 -record(validator,
         {
-         owner,
          addr,
          sig_fun
         }).
@@ -149,24 +148,17 @@ create_account_next(S, V, [Id]) ->
 
 %% --- Operation: validator ---
 
-validator_pre(S) ->
-    S#s.accounts /= [].
+validator_args(_S) ->
+    [].
 
-validator_args(S) ->
-    [S#s.val_ctr, elements([Id || {Id, _, _} <- S#s.accounts])].
-
-validator_pre(S, [_, Owner]) ->
-    lists:keymember(Owner, 1, S#s.accounts).
-
-validator(_, Owner) ->
+validator() ->
     [{Addr, {_Pub, _Priv, SigFun}}] = test_utils:generate_keys(1),
-    #validator{owner = Owner,
-               addr = Addr,
+    #validator{addr = Addr,
                sig_fun = SigFun}.
 
-validator_next(S, V, [Ctr, Owner]) ->
-    S#s{validator_idxs = S#s.validator_idxs ++ [{Ctr, V, Owner}],
-        val_ctr = Ctr + 1}.
+validator_next(S, V, []) ->
+    S#s{validator_idxs = S#s.validator_idxs ++ [{S#s.val_ctr, V}],
+        val_ctr = S#s.val_ctr + 1}.
 
 
 %% TRansactions
@@ -202,20 +194,20 @@ tx_coinbase_next(S, SymbTx, [Id, Balance]) ->
 %% --- Operation: tx_consensus ---
 tx_consensus_pre(S) ->
     S#s.height == 0 andalso
+        S#s.accounts /= [] andalso
         unused_validators(S) /= [] andalso
         length(S#s.group) =< ?initial_validators.
 
 tx_consensus_args(S) ->
-    ?LET(Ctr, elements(unused_validators(S)),
-         [Ctr, validator_owner(S, Ctr), ?min_stake + 3]).
+    ?LET({Ctr, {Id, _, _}}, {elements(unused_validators(S)), elements(S#s.accounts)},
+         [Ctr, Id, ?min_stake + 3]).
 
+%% for shrinking, make sure shrunk examples are still valid
 tx_consensus_pre(S, [Ctr, Owner, _]) ->
     %% only 1 consensus Tx per validator
     %% There must be a coinbase for the owner
     lists:member(Ctr, unused_validators(S)) andalso
-        [ consensus || {C, _, O} <- S#s.validator_idxs,
-                       C == Ctr andalso O == Owner,
-                       lists:keymember(Owner, 1, S#s.accounts)] /= [].  %% for shrinking
+        lists:keymember(Owner, 1, S#s.accounts).
 
 tx_consensus(S, Ctr, Owner, Stake) ->
     blockchain_txn_gen_validator_v1:new(validator_address(S, Ctr),
@@ -226,7 +218,7 @@ tx_consensus_next(S, SymbTx, [Ctr, Owner, Stake]) ->
     S#s{txs = S#s.txs ++ [#{kind => consensus, validator => Ctr, account => Owner, stake => Stake, sym => SymbTx}],
         accounts = lists:keyreplace(Owner, 1, S#s.accounts, {Owner, B, Stake + Stk}),
         group = S#s.group ++ [ Ctr ],
-        staked = S#s.staked ++ [ #{idx => Ctr, stake => Stake} ]}.
+        staked = S#s.staked ++ [ #{idx => Ctr, stake => Stake, owner => Owner} ]}.
 
 %% --- Operation: stake ---
 %% Moving balance to stake
@@ -236,8 +228,8 @@ tx_stake_pre(S) ->
         unused_validators(S) /= [].
 
 tx_stake_args(S) ->
-    ?LET(Ctr, elements(unused_validators(S)),
-         [Ctr, validator_owner(S, Ctr), ?min_stake]).
+    ?LET({Ctr, {Id, _, _}}, {elements(unused_validators(S)), elements(S#s.accounts)},
+         [Ctr, Id, ?min_stake]).
 
 tx_stake_pre(S, [Ctr, Owner, Stake]) ->
     tx_stake_valid(S, [Ctr, Owner, Stake]).
@@ -246,12 +238,10 @@ tx_stake_valid(S, [Ctr, Owner, Stake]) ->
     %% only 1 stake Tx per validator
     %% There must be an account for the owner (or a tx that creates an account but that's for later)
     lists:member(Ctr, unused_validators(S)) andalso
-        [ account || {C, _, O} <- S#s.validator_idxs,
-                     C == Ctr andalso O == Owner,
-                     case lists:keyfind(Owner, 1, S#s.accounts) of
-                         {_, Balance, _} -> Balance >= Stake;
-                         _ -> false
-                     end] /= [].  %% for shrinking
+        case lists:keyfind(Owner, 1, S#s.accounts) of
+            {_, Balance, _} -> Balance >= Stake;
+            _ -> false
+        end.
 
 tx_stake(S, Ctr, Owner, Stake) ->
     Val = get_validator(S, Ctr),
@@ -267,7 +257,7 @@ tx_stake_next(S, SymbTx, [Ctr, Owner, Stake]) ->
     {Owner, B, Stk} = lists:keyfind(Owner, 1, S#s.accounts),
     S#s{txs = S#s.txs ++ [#{kind => stake, validator => Ctr, account => Owner, stake => Stake, sym => SymbTx}],
         accounts = lists:keyreplace(Owner, 1, S#s.accounts, {Owner, B - Stake, Stk + Stake}),
-        staked = S#s.staked ++ [#{idx => Ctr, stake => Stake}]}.
+        staked = S#s.staked ++ [#{idx => Ctr, stake => Stake, owner => Owner}]}.
 
 %% One can either use same operation to produce both valid and invalid transactions,
 %% or use one operation for guaranteed positive and one for guaranteed negative transactions.
@@ -281,26 +271,31 @@ neg_tx_stake_pre(S) ->
         unused_validators(S) /= [].
 
 neg_tx_stake_args(S) ->
-    ?LET(Fault, elements([used_validator || S#s.staked /= []] ++ [wrong_signer || length(S#s.accounts) > 1] ++ [too_little_stake]),
-    ?LET(Ctr, inject(S, used_validator, Fault,  elements(unused_validators(S))),
-         [Fault, Ctr, inject(S, wrong_signer, Fault, validator_owner(S, Ctr)),
-          inject(S, too_little_stake, Fault, ?min_stake)])).
+    ?LET(Fault, elements([used_validator || S#s.staked /= []] ++ [bad_sig, too_little_stake, too_much_stake]),
+    ?LET({Ctr, {Id, _B, _}}, {inject(S, used_validator, Fault,  elements(unused_validators(S))),
+                               elements(S#s.accounts)},
+         [Fault, Ctr, Id,
+          inject(S, too_much_stake, Fault, inject(S, too_little_stake, Fault, ?min_stake))])).
 
 neg_tx_stake_pre(S, [_, Ctr, Owner, Stake]) ->
     lists:keymember(Owner, 1, S#s.account_idxs) andalso
     lists:keymember(Ctr, 1, S#s.validator_idxs) andalso
         not tx_stake_valid(S, [Ctr, Owner, Stake]).
 
-neg_tx_stake(S, _Fault, Ctr, Owner, Stake) ->
+neg_tx_stake(S, Fault, Ctr, Owner, Stake) ->
     Val = get_validator(S, Ctr),
-    Account = get_account(S, validator_owner(S, Ctr)),
-    PossiblyWrongAccount = get_account(S, Owner),
+    Account = get_account(S, Owner),
+    SigFun =
+        case Fault of
+            bad_sig -> Val#validator.sig_fun;
+            _       -> Account#account.sig_fun
+        end,
     Txn = blockchain_txn_stake_validator_v1:new(
             Val#validator.addr, Account#account.address,
             Stake,
             35000
            ),
-    blockchain_txn_stake_validator_v1:sign(Txn, PossiblyWrongAccount#account.sig_fun).
+    blockchain_txn_stake_validator_v1:sign(Txn, SigFun).
 
 neg_tx_stake_next(S, SymbTx, [Fault, Ctr, Owner, Stake]) ->
     S#s{txs = S#s.txs ++ [#{kind => Fault, validator => Ctr, account => Owner, stake => Stake, sym => SymbTx}]}.
@@ -317,10 +312,10 @@ tx_unstake_args(S) ->
     CoolDown = maps:get(?stake_withdrawal_cooldown, val_vars()),
     ?LET(Kind, fault(elements([unstake_from_group, unstake_wrong_stake, short_cooldown] ++
                                   [wrong_owner || length(S#s.accounts) > 1]), unstake),
-    ?LET({Ctr, Stake}, elements([{Ctr, Stake} || #{idx := Ctr, stake := Stake} <- S#s.staked,
+    ?LET({Ctr, Stake, Owner}, elements([{Ctr, Stake, Owner} || #{idx := Ctr, stake := Stake, owner := Owner} <- S#s.staked,
                                                  Kind /= unstake_from_group orelse
                                                      lists:member(Ctr, S#s.group)]),
-         [Kind, Ctr, inject(S, wrong_owner, Kind, validator_owner(S, Ctr)),
+         [Kind, Ctr, inject(S, wrong_owner, Kind, Owner),
           inject(S, unstake_wrong_stake, Kind, Stake),
           inject(S, short_cooldown, Kind, choose(CoolDown, CoolDown + 3))])).
 
@@ -330,22 +325,27 @@ tx_unstake_pre(S, [Kind, Ctr, Owner, Stake, DeltaHeight]) ->
     (Kind /= unstake orelse tx_unstake_valid(S, [Ctr, Owner, Stake, DeltaHeight])).   %% avoid shrinking to invalid
 
 tx_unstake_valid(S, [Ctr, Owner, Stake, _DeltaHeight]) ->
-    lists:member(Ctr, [Id || #{idx := Id, stake:= Stk} <- S#s.staked,
+    lists:member(Ctr, [Id || #{idx := Id, stake:= Stk, owner := A} <- S#s.staked,
                              not lists:member(Id, S#s.group),
-                             Stk == Stake]) andalso
-        not lists:keymember(Ctr, 1, S#s.unstaked) andalso
-        validator_owner(S, Ctr) == Owner.
+                             Stk == Stake,
+                             Owner == A]) andalso
+        not lists:keymember(Ctr, 1, S#s.unstaked).
 
-tx_unstake(S, _Kind, Ctr, Owner, Stake, DeltaHeight) ->
+tx_unstake(S, Fault, Ctr, Owner, Stake, DeltaHeight) ->
     Val = get_validator(S, Ctr),
     Account = get_account(S, Owner),
+    SigFun =
+        case Fault of
+            bad_sig -> Val#validator.sig_fun;
+            _       -> Account#account.sig_fun
+        end,
     Txn = blockchain_txn_unstake_validator_v1:new(
             Val#validator.addr, Account#account.address,
             Stake,
             S#s.height + DeltaHeight,
             35000
            ),
-    blockchain_txn_unstake_validator_v1:sign(Txn, Account#account.sig_fun).
+    blockchain_txn_unstake_validator_v1:sign(Txn, SigFun).
 
 tx_unstake_next(S, SymbTx, [Kind, Ctr, Owner, Stake, DeltaHeight]) ->
     Tx = #{kind => Kind, validator => Ctr, account => Owner, height => S#s.height + DeltaHeight, sym => SymbTx},
@@ -413,7 +413,7 @@ genesis_txs_features(S, [], _Res) ->
 
 %% --- Operation: genesis_txs ---
 add_block_pre(S) ->
-    S#s.height > 0 andalso S#s.group /= []. %% andalso S#s.txs /= [].
+    S#s.height > 0.
 
 add_block_args(_S) ->
     [].
@@ -423,7 +423,7 @@ add_block(S) ->
     Transactions =  [ Tx || #{sym := Tx} <- S#s.txs ],
 
     STxns = lists:sort(fun blockchain_txn:sort/2, Transactions),
-    io:format("Transactions to validate to block: ~p\n", [STxns]),
+    %% io:format("Transactions to validate to block: ~p\n", [STxns]),
     {Valid, _Invalid} = blockchain_txn:validate(STxns, Chain),
 
     {ok, HeadBlock} = blockchain:head_block(Chain),
@@ -444,7 +444,7 @@ add_block(S) ->
          },
     Block0 = blockchain_block_v1:new(MBlock),
     BinBlock = blockchain_block:serialize(Block0),
-    Group = [ Val || {Id, Val, _} <- S#s.validator_idxs,
+    Group = [ Val || {Id, Val} <- S#s.validator_idxs,
                      lists:member(Id, S#s.group)],
     Signatures = [ {Addr, Sign(BinBlock)} || #validator{addr = Addr, sig_fun = Sign} <- Group ],
     Block1 = blockchain_block:set_signatures(Block0, Signatures),
@@ -524,7 +524,7 @@ stakes(S) ->
     {Staked, Circ, Cool}.
 
 stakes_post(S, [], {Staked, Circ, Cool}) ->
-    ModelUnstaked = lists:sum([Stk || {_, Stk, _} <- S#s.chain_unstaked ]),
+    ModelUnstaked = lists:sum([Stk || {_, Stk, _H} <- S#s.chain_unstaked ]),
     ModelStaked = lists:sum([Stk || #{stake := Stk} <- S#s.chain_staked]) - ModelUnstaked,
     ModelTotalBalance = lists:sum([B || {_, B, _Stk} <- S#s.chain_accounts]),
     eqc_statem:conj(
@@ -586,6 +586,8 @@ prop_stake_txs() ->
        begin
            %% these should be idempotent
            _ = application:ensure_all_started(lager),
+           lager:set_loglevel(lager_console_backend, error),
+
            _ = blockchain_lock:start_link(),
            application:set_env(blockchain, test_mode, true),
 
@@ -611,26 +613,15 @@ prop_stake_txs() ->
 
 validator_address(S, Ctr) ->
     case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
-        {_, #validator{addr = Addr}, _} ->
+        {_, #validator{addr = Addr}} ->
             Addr;
         _ ->
             undefined
     end.
 
-validator_owner(S, Ctr) ->
-    case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
-        {_, _, Owner} ->
-            Owner;
-        _ ->
-            undefined
-    end.
-
-validator_address(#validator{addr = Addr}) ->
-    Addr.
-
 get_validator(S, Ctr) ->
     case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
-        {_, Val, _} ->
+        {_, Val} ->
             Val;
         _ ->
             undefined
@@ -658,12 +649,14 @@ unused_accounts(S) ->
     [ Id || {Id, _} <- S#s.account_idxs ] -- [ Id || {Id, _, _} <- S#s.accounts ].
 
 unused_validators(S) ->
-    [ Id || {Id, _, _} <- S#s.validator_idxs ] --
+    [ Id || {Id, _} <- S#s.validator_idxs ] --
         (S#s.void ++ S#s.transferred ++ [ Ctr || #{idx := Ctr} <- S#s.staked ]).
 
 adapt_height(S, Height) ->
-    ReleaseStake = [ {Ctr, Stk, validator_owner(S, Ctr)}
+    ReleaseStake = [ {Ctr, Stk, Owner}
                      || {Ctr, Stk, H} <- S#s.unstaked,
+                        #{owner := Owner} <- [ Staked || #{idx := Idx} = Staked <- S#s.staked,
+                                                         Ctr == Idx],
                         H =< Height ],
     S#s{height = Height,
         staked = [ Staked || #{idx := Ctr} = Staked <- S#s.staked,
@@ -688,9 +681,8 @@ inject(_, short_cooldown, _) ->
     choose(0, maps:get(?stake_withdrawal_cooldown, val_vars()) - 1);
 inject(_, too_little_stake, _) ->
     choose(-1, ?min_stake-1);
-inject(S, wrong_signer, OwnerGen) ->
-    ?LET(Owner, OwnerGen,
-         elements([Id || {Id, _, _} <- S#s.accounts, Id /= Owner]));
+inject(_, too_much_stake, _) ->
+    choose(?min_stake, 2 * ?min_stake - 1);
 inject(S, wrong_owner, OwnerGen) ->
     ?LET(Owner, OwnerGen,
          elements([Id || {Id, _, _} <- S#s.accounts, Id /= Owner]));
