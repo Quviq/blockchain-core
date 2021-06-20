@@ -10,6 +10,8 @@
 
 -include_lib("eqc/include/eqc.hrl").
 -include_lib("eqc/include/eqc_statem.hrl").
+-include_lib("eqc/include/eqc_mocking.hrl").
+%% We cannot use eqc_components, wrap_call due to wrap_call conflict
 
 -include_lib("stdlib/include/assert.hrl").
 
@@ -42,6 +44,7 @@
          void = [],  %% void validators, cannot be used again
 
          height = 0,
+         election_height = 0,
          chain,
 
          %% mapping from account to runtime account address and details
@@ -77,16 +80,17 @@ initial_state() ->
     #s{accounts = []}.
 
 make_base_dir() ->
-    "stake-txns-dir-"++integer_to_list(rand:uniform(8999999) + 1000000).
+    Digits = integer_to_list(os:system_time(millisecond) rem 10000000),
+    "stake-txns-dir-"++Digits.
 
 val_vars() ->
     #{
-      ?election_version => 5,
+      ?election_version => 5,    %% TODO also test for lower versions?
       ?validator_version => 2,
       ?validator_minimum_stake => ?min_stake,
       ?validator_liveness_grace_period => 100,
       ?validator_liveness_interval => 2000,
-      ?stake_withdrawal_cooldown => 5,
+      ?stake_withdrawal_cooldown => 2,
       ?stake_withdrawal_max => 500,
       %?tenure_penalty => 1.0,
       ?dkg_penalty => 1.0,
@@ -107,7 +111,7 @@ wrap_call(S, {call, Mod, Cmd, Args}) ->
     WithState = lists:member(Cmd, [genesis_txs, add_block,
                                    balances, stakes,
                                    tx_transfer, tx_coinbase, tx_consensus,
-                                   tx_stake, tx_unstake, tx_transfer,
+                                   tx_stake, tx_unstake, tx_transfer, tx_election,
                                    neg_tx_stake]),
     try if WithState -> {ok, apply(Mod, Cmd, [S | Args])};
            not WithState -> {ok, apply(Mod, Cmd, Args)}
@@ -230,7 +234,10 @@ tx_stake_args(S) ->
          [Ctr, Id, ?min_stake]).
 
 tx_stake_pre(S, [Ctr, Owner, Stake]) ->
-    tx_stake_valid(S, [Ctr, Owner, Stake]).
+    lists:keymember(Owner, 1, S#s.account_idxs) andalso
+        lists:keymember(Ctr, 1, S#s.validator_idxs) andalso
+        valid_order(S, {stake, Owner}) andalso
+        tx_stake_valid(S, [Ctr, Owner, Stake]).
 
 tx_stake_valid(S, [Ctr, Owner, Stake]) ->
     %% only 1 stake Tx per validator
@@ -319,7 +326,9 @@ tx_unstake_args(S) ->
 tx_unstake_pre(S, [Kind, Ctr, Owner, Stake, DeltaHeight]) ->
     lists:keymember(Owner, 1, S#s.account_idxs) andalso
     lists:keymember(Ctr, 1, S#s.validator_idxs) andalso
-    (Kind /= unstake orelse tx_unstake_valid(S, [Ctr, Owner, Stake, DeltaHeight])).   %% avoid shrinking to invalid
+    (Kind /= unstake orelse
+                       (valid_order(S, {unstake, Owner}) andalso
+                        tx_unstake_valid(S, [Ctr, Owner, Stake, DeltaHeight]))).
 
 tx_unstake_valid(S, [Ctr, Owner, Stake, _DeltaHeight]) ->
     lists:member(Ctr, [Id || #{idx := Id, stake:= Stk, owner := A} <- S#s.staked,
@@ -374,7 +383,8 @@ tx_transfer_args(S) ->
          [Ctr, Owner, NewCtr, NewId, Stake, oneof([0, Balance div 2, ?bones(9000)])])).
 
 tx_transfer_pre(S, [Ctr, Owner, NewCtr, NewOwner, Stake, Amount]) ->
-    tx_transfer_valid(S, [Ctr, Owner,  NewCtr, NewOwner, Stake, Amount]).
+    valid_order(S, {transfer, Owner, NewOwner}) andalso
+        tx_transfer_valid(S, [Ctr, Owner,  NewCtr, NewOwner, Stake, Amount]).
 
 tx_transfer_valid(S, [Ctr, Owner, NewCtr, NewOwner, Stake, Amount]) ->
     tx_unstake_valid(S, [Ctr, Owner, Stake, S#s.height]) andalso
@@ -385,7 +395,8 @@ tx_transfer_valid(S, [Ctr, Owner, NewCtr, NewOwner, Stake, Amount]) ->
         end andalso
         case lists:keyfind(NewOwner, 1, S#s.accounts) of
             {_, Balance, _} -> Balance >= Amount;
-            _ -> Amount == 0  %% trying
+            _ -> Amount == 0 andalso
+                     lists:keyfind(NewOwner, 1, S#s.account_idxs) %% trying to create account?
         end.
 
 tx_transfer(S, Ctr, Owner, NewCtr, NewOwner, Stake, Amount) ->
@@ -422,6 +433,74 @@ tx_transfer_next(S, SymbTx, [Ctr, Owner, NewCtr, NewOwner, Stake, Amount]) ->
         transferred = S#s.transferred ++ [#{idx => NewCtr, stake => Stake, owner => NewOwner}],
         void = S#s.void ++ [Ctr]}.
 
+%% --- Operation: election ---
+
+tx_election_pre(S) ->
+    S#s.height > 0 andalso
+       %% S#s.height - S#s.election_height > maps:get(?election_interval, val_vars()) andalso
+       length([ Idx || #{idx := Idx} <-S#s.staked ]) > maps:get(?num_consensus_members, val_vars()).
+
+
+%% possible error: duplicate_group,{1,1}  when reusing [0] as validators (group [0,1,2,3])
+%%  no members when using unused validators or when list in new group is empty
+%% wrong_members_size,{4,1} if there are less than 4 members
+
+%% This cannot shrink nicely.. since hashes change when shrinking and selection depends on hash
+tx_election_args(S) ->
+    ?LET(Kind, case S#s.height - S#s.election_height < maps:get(?election_interval, val_vars()) of
+                   true -> wrong_election_height;
+                   false -> fault(elements([election_no_member || unused_validators(S) /= []] ++
+                                               [election_too_few_members, election_too_many_members]), election)
+               end,
+    ?LET(Staked, oneof([S#s.group, noshrink(shuffle([ Idx || #{idx := Idx} <- S#s.staked]))]),
+    ?LET(NewCandidates, [elements(unused_validators(S)) || Kind == election_no_member ] ++ Staked,
+         [Kind, lists:sublist(NewCandidates, maps:get(?num_consensus_members, val_vars()) +
+                                  case Kind of
+                                      election_too_few_members -> -1;
+                                      election_too_many_members -> 1;
+                                      _ -> 0
+                                  end)]))).
+
+tx_election_pre(S, [Kind, NewGroup]) ->
+        lists:all(fun(Ctr) -> lists:keymember(Ctr, 1, S#s.validator_idxs) end,
+                  NewGroup) andalso
+            (Kind /= election orelse tx_election_valid(S, [Kind, NewGroup])).
+
+tx_election_valid(S, [_Kind, NewGroup]) ->
+    length(NewGroup) == maps:get(?num_consensus_members, val_vars()) andalso
+        S#s.height - S#s.election_height >= maps:get(?election_interval, val_vars()) andalso
+        not lists:any(fun(V) -> lists:member(V, unused_validators(S)) end, NewGroup).
+
+tx_election_adapt(_S, [election, NewGroup]) ->
+    [invalid_election, NewGroup];
+tx_election_adapt(_S, [_, _NewGroup]) ->
+    false.
+
+tx_election(S, _, SymNewGroup) ->
+
+    NewGroup = [ Val || {Id, Val} <- S#s.validator_idxs,
+                        lists:member(Id, SymNewGroup)],
+    NewGroupAddresses = [ Addr || #validator{address = Addr} <- NewGroup],
+    eqc_mocking:init_lang(?REPLICATE(?XALT(?EVENT(blockchain_election, new_group, ['_', '_', '_', '_'],
+                                                  NewGroupAddresses),
+                                           ?EVENT(blockchain_txn_consensus_group_v1, is_valid, ['_', '_'], ok)))),
+    Artifact = term_to_binary(NewGroupAddresses),
+               %% Note that this choice binds the implementation strongly to Erlang (version)
+    Signatures = [ {Addr, Sign(Artifact)} || #validator{address = Addr, sig_fun = Sign} <- NewGroup ],
+    Proof = term_to_binary(Signatures, [compressed]),
+    blockchain_txn_consensus_group_v1:new(NewGroupAddresses, Proof, S#s.height, 0).
+
+tx_election_next(S, SymbTx, [Kind, NewGroup]) when Kind /= election ->
+    S#s{txs = S#s.txs ++ [#{kind => Kind, group => NewGroup, sym => SymbTx}]};
+tx_election_next(S, SymbTx, [election, NewGroup]) ->
+    %% Election txsn is only accepted if all other txs are rejected
+    S#s{txs = S#s.txs ++ [#{kind => election, group => NewGroup, sym => SymbTx}],
+        accounts = S#s.chain_accounts,
+        staked = S#s.chain_staked,
+        unstaked = S#s.chain_unstaked,
+        group = NewGroup,
+        void = S#s.void ++ NewGroup}.
+
 
 %% --- Operation: genesis_txs ---
 genesis_txs_pre(S) ->
@@ -444,7 +523,7 @@ genesis_txs(S) ->
         [ Tx || #{kind := consensus, sym := Tx} <- Transactions ],
 
     GenConsensusGroupTx = blockchain_txn_consensus_group_v1:new(
-                           [ validator_address(S, Ctr) || #{kind := consensus, validator := Ctr} <- Transactions],
+                           [ validator_address(S, Ctr) || Ctr <- S#s.group],
                             <<"proof">>, 1, 0),
 
     Txs = InitialVars ++
@@ -477,7 +556,10 @@ add_block_pre(S) ->
 
 %% here we can take a subset of group to sign (>= 4 members).
 add_block_args(S) ->
-    [S#s.group].
+    [S#s.chain_group].
+
+add_block_pre(S, [Group]) ->
+    Group == S#s.chain_group.  %% TODO take valid subset
 
 add_block(S, Signers) ->
     Chain = S#s.chain,
@@ -519,6 +601,7 @@ add_block_next(S0, _Value, [_]) ->
     S#s{chain_accounts = S#s.accounts,
         chain_staked = S#s.staked,
         chain_unstaked = S#s.unstaked,
+        chain_group = S#s.group,
         txs = []}.
 
 add_block_post(S, [_], {Height, AcceptedTxs}) ->
@@ -532,12 +615,13 @@ add_block_post(S, [_], {Height, AcceptedTxs}) ->
         eqc_statem:tag(valid_reject, eq(WronglyRejected, [])) ]).
 
 
-add_block_features(S, [_], _Res) ->
-    [{tx, Kind} || #{kind := Kind} <- S#s.txs ].
+add_block_features(S, [_], {_, Valid}) ->
+    [ {tx, Kind} || #{kind := Kind} <- S#s.txs ] ++
+        [ {txs_per_block, length(Valid)} ].
 
 valid_txs(S) ->
     [ Tx || #{kind := Kind} = Tx <- S#s.txs,
-            lists:member(Kind, [stake, unstake, transfer])].
+            lists:member(Kind, [stake, unstake, transfer])].  %% , election
 
 
 %% Observational operations ---------------------------------------------------
@@ -624,17 +708,34 @@ weight(S, tx_consensus) ->
     end;
 weight(S, tx_stake) ->
     NrTxs = nr_txs(S, stake),
-    if S#s.height == 0 -> 0;
-       NrTxs < ?initial_validators -> 20;
-       NrTxs > 5 -> 1;
+    NrOther = nr_txs(S, unstake),
+    Election = (nr_txs(S, election) /= 0),
+    if Election -> 0;
+       S#s.height == 0; NrOther > 0 -> 0;
+       NrTxs < 5 -> 3 * 20;
+       true -> 2
+    end;
+weight(S, tx_unstake) ->
+    NrTxs = nr_txs(S, unstake),
+    NrOther = nr_txs(S, transfer),
+    Election = (nr_txs(S, election) /= 0),
+    if Election -> 0;
+       S#s.height == 0; NrOther > 0 -> 0;
+       NrTxs < 5 -> 2 * 20;
        true -> 2
     end;
 weight(S, tx_transfer) ->
     NrTxs = nr_txs(S, transfer),
-    if S#s.height == 0 -> 0;
-       NrTxs < ?initial_validators -> 30;
+    Election = (nr_txs(S, election) /= 0),
+    if Election -> 0;
+        NrTxs < ?initial_validators -> 20;
        NrTxs > 5 -> 1;
        true -> 2
+    end;
+weight(S, tx_election) ->
+    ElectionInterval = maps:get(?election_interval, val_vars()),
+    if S#s.height rem ElectionInterval /= 0 -> 1;
+       true -> 20
     end;
 weight(_, neg_tx_stake) -> 0;
 weight(_, _) ->
@@ -650,17 +751,25 @@ prop_stake_txs() ->
     prop_stake_txs(#{loglevel => error}).
 
 prop_stake_txs(Opts) ->
-    fault_rate(0, 20,
+    fault_rate(1, 20,
+    ?SETUP(fun() ->
+                   _ = application:ensure_all_started(lager),
+                   lager:set_loglevel(lager_console_backend, maps:get(loglevel, Opts, info)),
+                   %% Warning this is a bit ugly, but we need to mock rand
+                   eqc_mocking:start_mocking(api_spec()),
+                   fun() ->
+                           %% Put original rand module back
+                           eqc_mocking:stop_mocking()
+                   end
+           end,
+    ?FORALL(Shrinking, ?SHRINK(false, [true]),
     ?FORALL(
        %% default to longer commands sequences for better coverage
        Cmds, more_commands(5, commands(?M)),
        %% Cmds, noshrink(more_commands(5, commands(?M))),
+       ?ALWAYS(if Shrinking -> 10; true -> 1 end,
        begin
-           %% these should be idempotent
-           _ = application:ensure_all_started(lager),
-           lager:set_loglevel(lager_console_backend, maps:get(loglevel, Opts, info)),
-
-           _ = blockchain_lock:start_link(),
+           {ok, Pid} = blockchain_lock:start_link(),
            application:set_env(blockchain, test_mode, true),
 
            %% fresh dir for each chain
@@ -668,25 +777,54 @@ prop_stake_txs(Opts) ->
            {H, S, Res} = run_commands(Cmds, [{basedir, BaseDir}]),
 
            %% cleanup
+           unlink(Pid),
+           exit(Pid, kill),
            os:cmd("rm -r " ++ filename:join(".", BaseDir)),
 
+           {TxsPerBlock, Features} =
+               lists:foldl(fun({txs_per_block, A}, {PBs, Fs}) ->
+                                   {[A|PBs], Fs};
+                              (F, {PBs, Fs}) ->
+                                   {PBs, [F|Fs]}
+                           end, {[], []}, call_features(H)),
            measure(height, S#s.height,
            measure(accounts, length(S#s.accounts),
+           aggregate(with_title(txs_per_block), TxsPerBlock,
            aggregate(command_names(Cmds),
-           aggregate(call_features(H),
+           aggregate(Features,
            features(call_features(H),
            eqc_statem:pretty_commands(?M,
                                       Cmds,
                                       {H, S, Res},
-                                      Res == ok))))))
-       end)).
+                                      Res == ok)))))))
+       end))))).
 
+api_spec() ->
+    #api_spec{
+       modules =
+             #api_module{
+                name = blockchain_election,
+                fallback = blockchain_election,
+                functions = [ #api_fun{ name = new_group, arity = 4, fallback = false }
+                             ]}
+           ]}.
+
+
+%% #api_fun{ name = seed, arity = 2, fallback = true }
 
 %%% helpers
 
 validator_address(S, Ctr) ->
     Val = get_validator(S, Ctr),
     Val#validator.address.
+
+validator_idx(S, Address) ->
+    case [ Idx || {Idx, #validator{address = A}} <- S#s.validator_idxs, A == Address ] of
+        [Idx] ->
+            Idx;
+        _ ->
+            error
+    end.
 
 get_validator(S, Ctr) ->
     case lists:keyfind(Ctr, 1, S#s.validator_idxs) of
@@ -758,3 +896,15 @@ inject(_, Kind, Gen) ->
     eqc_messenger:message("undefined fault injection ~p", [Kind]),
     io:format("undefined fault injection ~p", [Kind]),
     Gen.
+
+%% Ensure that transactions only are generated when they are in valid order
+valid_order(S, {stake, _Owner}) ->
+    [ x || #{kind := Kind} <- S#s.txs,
+           Kind == unstake orelse Kind == transfer ] == [];
+valid_order(S, {unstake, _Owner}) ->
+    [ x || #{kind := Kind} <- S#s.txs,
+           Kind == transfer ] == [];
+    %% %% There is no unstake after a transfer for the same owner
+    %% [ x || #{kind := transfer, account := A1, new_account := A2} <- S#s.txs] == [];
+valid_order(_S, {transfer, _, _}) ->
+    true.
