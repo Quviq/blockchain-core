@@ -437,6 +437,7 @@ tx_transfer_next(S, SymbTx, [Ctr, Owner, NewCtr, NewOwner, Stake, Amount]) ->
 
 tx_election_pre(S) ->
     S#s.height > 0 andalso
+         nr_txs(S, election) == 0 andalso  %% I can handle only 1 election in one block in mock
        %% S#s.height - S#s.election_height > maps:get(?election_interval, val_vars()) andalso
        length([ Idx || #{idx := Idx} <-S#s.staked ]) > maps:get(?num_consensus_members, val_vars()).
 
@@ -461,6 +462,8 @@ tx_election_args(S) ->
                                       _ -> 0
                                   end)]))).
 
+tx_election_pre(S, [wrong_election_height, _NewGroup]) ->
+    S#s.height - S#s.election_height < maps:get(?election_interval, val_vars());  %% for shrinking
 tx_election_pre(S, [Kind, NewGroup]) ->
         lists:all(fun(Ctr) -> lists:keymember(Ctr, 1, S#s.validator_idxs) end,
                   NewGroup) andalso
@@ -469,21 +472,14 @@ tx_election_pre(S, [Kind, NewGroup]) ->
 tx_election_valid(S, [_Kind, NewGroup]) ->
     length(NewGroup) == maps:get(?num_consensus_members, val_vars()) andalso
         S#s.height - S#s.election_height >= maps:get(?election_interval, val_vars()) andalso
-        not lists:any(fun(V) -> lists:member(V, unused_validators(S)) end, NewGroup).
-
-tx_election_adapt(_S, [election, NewGroup]) ->
-    [invalid_election, NewGroup];
-tx_election_adapt(_S, [_, _NewGroup]) ->
-    false.
+        NewGroup -- [Idx || #{idx := Idx} <- S#s.staked] == [].
 
 tx_election(S, _, SymNewGroup) ->
-
     NewGroup = [ Val || {Id, Val} <- S#s.validator_idxs,
                         lists:member(Id, SymNewGroup)],
     NewGroupAddresses = [ Addr || #validator{address = Addr} <- NewGroup],
-    eqc_mocking:init_lang(?REPLICATE(?XALT(?EVENT(blockchain_election, new_group, ['_', '_', '_', '_'],
-                                                  NewGroupAddresses),
-                                           ?EVENT(blockchain_txn_consensus_group_v1, is_valid, ['_', '_'], ok)))),
+    eqc_mocking:init_lang(?REPLICATE(?EVENT(blockchain_election, new_group, ['_', '_', '_', '_'],
+                                                  NewGroupAddresses))),
     Artifact = term_to_binary(NewGroupAddresses),
                %% Note that this choice binds the implementation strongly to Erlang (version)
     Signatures = [ {Addr, Sign(Artifact)} || #validator{address = Addr, sig_fun = Sign} <- NewGroup ],
@@ -493,8 +489,8 @@ tx_election(S, _, SymNewGroup) ->
 tx_election_next(S, SymbTx, [Kind, NewGroup]) when Kind /= election ->
     S#s{txs = S#s.txs ++ [#{kind => Kind, group => NewGroup, sym => SymbTx}]};
 tx_election_next(S, SymbTx, [election, NewGroup]) ->
-    %% Election txsn is only accepted if all other txs are rejected
-    S#s{txs = S#s.txs ++ [#{kind => election, group => NewGroup, sym => SymbTx}],
+    %% Election is first, forget all other transactions and revert state
+    S#s{txs = [#{kind => election, group => NewGroup, sym => SymbTx}],
         accounts = S#s.chain_accounts,
         staked = S#s.chain_staked,
         unstaked = S#s.chain_unstaked,
@@ -598,10 +594,14 @@ add_block(S, Signers) ->
 
 add_block_next(S0, _Value, [_]) ->
     S = adapt_height(S0, S0#s.height + 1),
+    HasValidElection = nr_txs(S, election) > 0,
     S#s{chain_accounts = S#s.accounts,
         chain_staked = S#s.staked,
         chain_unstaked = S#s.unstaked,
         chain_group = S#s.group,
+        election_height = if HasValidElection -> S#s.height;
+                             true -> S#s.election_height
+                          end,
         txs = []}.
 
 add_block_post(S, [_], {Height, AcceptedTxs}) ->
@@ -621,7 +621,7 @@ add_block_features(S, [_], {_, Valid}) ->
 
 valid_txs(S) ->
     [ Tx || #{kind := Kind} = Tx <- S#s.txs,
-            lists:member(Kind, [stake, unstake, transfer])].  %% , election
+            lists:member(Kind, [stake, unstake, transfer, election])].
 
 
 %% Observational operations ---------------------------------------------------
@@ -756,18 +756,14 @@ prop_stake_txs(Opts) ->
                    _ = application:ensure_all_started(lager),
                    lager:set_loglevel(lager_console_backend, maps:get(loglevel, Opts, info)),
                    %% Warning this is a bit ugly, but we need to mock rand
+                   %% ok = code:unstick_dir(filename:dirname(code:which(rand))),
                    eqc_mocking:start_mocking(api_spec()),
                    fun() ->
                            %% Put original rand module back
                            eqc_mocking:stop_mocking()
                    end
            end,
-    ?FORALL(Shrinking, ?SHRINK(false, [true]),
-    ?FORALL(
-       %% default to longer commands sequences for better coverage
-       Cmds, more_commands(5, commands(?M)),
-       %% Cmds, noshrink(more_commands(5, commands(?M))),
-       ?ALWAYS(if Shrinking -> 10; true -> 1 end,
+    ?FORALL(Cmds, more_commands(5, commands(?M)),
        begin
            {ok, Pid} = blockchain_lock:start_link(),
            application:set_env(blockchain, test_mode, true),
@@ -797,17 +793,27 @@ prop_stake_txs(Opts) ->
                                       Cmds,
                                       {H, S, Res},
                                       Res == ok)))))))
-       end))))).
+       end))).
 
 api_spec() ->
     #api_spec{
        modules =
+           [ %% #api_module{
+             %%   name = rand, fallback = ?MODULE,
+             %%   functions = [ #api_fun{ name = uniform, arity = 0 },
+             %%                 #api_fun{ name = seed, arity = 2 }]}
              #api_module{
                 name = blockchain_election,
                 fallback = blockchain_election,
                 functions = [ #api_fun{ name = new_group, arity = 4, fallback = false }
+              %%            ]},
+              %% #api_module{
+              %%    name = blockchain_txn_consensus_group_v1,
+              %%    fallback = blockchain_txn_consensus_group_v1,
+              %%    functions = [ #api_fun{ name = is_valid, arity = 2 }
                              ]}
            ]}.
+
 
 
 %% #api_fun{ name = seed, arity = 2, fallback = true }
