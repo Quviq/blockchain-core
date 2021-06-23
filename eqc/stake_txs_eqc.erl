@@ -161,7 +161,7 @@ validator_next(S, V, [Idx]) ->
     S#s{validator_idxs = S#s.validator_idxs ++ [{Idx, V}]}.
 
 
-%% TRansactions
+%% Transactions
 
 %% We have a 2 step process. In order to generate a transaction, we look at the state on chain
 %% as well as earlier created transactions. For example, there might be unused validators on
@@ -230,64 +230,31 @@ tx_stake_pre(S) ->
         unused_validators(S) /= [].
 
 tx_stake_args(S) ->
-    ?LET({Ctr, {Id, _, _}}, {elements(unused_validators(S)), elements(S#s.accounts)},
-         [Ctr, Id, ?min_stake]).
+    ?LET(Fault, fault(elements([used_validator, bad_sig, too_little_stake, too_much_stake]),
+                      stake),
+    ?LET({Ctr, {Id, _, _}}, {inject(S, used_validator, Fault, elements(unused_validators(S))),
+                             elements(S#s.accounts)},
+         [Fault, Ctr, Id, inject(S, too_much_stake, Fault, inject(S, too_little_stake, Fault, ?min_stake))])).
 
-tx_stake_pre(S, [Ctr, Owner, Stake]) ->
+tx_stake_pre(S, [Fault, Ctr, Owner, Stake]) ->
     lists:keymember(Owner, 1, S#s.account_idxs) andalso
         lists:keymember(Ctr, 1, S#s.validator_idxs) andalso
-        valid_order(S, {stake, Owner}) andalso
-        tx_stake_valid(S, [Ctr, Owner, Stake]).
+        case Fault of
+            stake ->
+                valid_order(S, {stake, Owner}) andalso
+                    tx_stake_valid(S, [Ctr, Owner, Stake]);
+            _ ->
+                not tx_stake_valid(S, [Ctr, Owner, Stake])
+        end.
 
 tx_stake_valid(S, [Ctr, Owner, Stake]) ->
-    %% only 1 stake Tx per validator
-    %% There must be an account for the owner (or a tx that creates an account but that's for later)
     lists:member(Ctr, unused_validators(S)) andalso
         case lists:keyfind(Owner, 1, S#s.accounts) of
             {_, Balance, _} -> Balance >= Stake;
             _ -> false
         end.
 
-tx_stake(S, Ctr, Owner, Stake) ->
-    Val = get_validator(S, Ctr),
-    Account = get_account(S, Owner),
-    Txn = blockchain_txn_stake_validator_v1:new(
-            Val#validator.address, Account#account.address,
-            Stake,
-            35000
-           ),
-    blockchain_txn_stake_validator_v1:sign(Txn, Account#account.sig_fun).
-
-tx_stake_next(S, SymbTx, [Ctr, Owner, Stake]) ->
-    {Owner, B, Stk} = lists:keyfind(Owner, 1, S#s.accounts),
-    S#s{txs = S#s.txs ++ [#{kind => stake, validator => Ctr, account => Owner, stake => Stake, sym => SymbTx}],
-        accounts = lists:keyreplace(Owner, 1, S#s.accounts, {Owner, B - Stake, Stk + Stake}),
-        staked = S#s.staked ++ [#{idx => Ctr, stake => Stake, owner => Owner}]}.
-
-%% One can either use same operation to produce both valid and invalid transactions,
-%% or use one operation for guaranteed positive and one for guaranteed negative transactions.
-
-%% --- Operation: stake ---
-%% Moving balance to stake
-
-%% instead of using fault_rate to steer distribution, we can now steer with weight function
-neg_tx_stake_pre(S) ->
-    S#s.height > 0 andalso
-        unused_validators(S) /= [].
-
-neg_tx_stake_args(S) ->
-    ?LET(Fault, elements([used_validator || S#s.staked /= []] ++ [bad_sig, too_little_stake, too_much_stake]),
-    ?LET({Ctr, {Id, _B, _}}, {inject(S, used_validator, Fault,  elements(unused_validators(S))),
-                               elements(S#s.accounts)},
-         [Fault, Ctr, Id,
-          inject(S, too_much_stake, Fault, inject(S, too_little_stake, Fault, ?min_stake))])).
-
-neg_tx_stake_pre(S, [_, Ctr, Owner, Stake]) ->
-    lists:keymember(Owner, 1, S#s.account_idxs) andalso
-    lists:keymember(Ctr, 1, S#s.validator_idxs) andalso
-        not tx_stake_valid(S, [Ctr, Owner, Stake]).
-
-neg_tx_stake(S, Fault, Ctr, Owner, Stake) ->
+tx_stake(S, Fault, Ctr, Owner, Stake) ->
     Val = get_validator(S, Ctr),
     Account = get_account(S, Owner),
     SigFun =
@@ -302,8 +269,16 @@ neg_tx_stake(S, Fault, Ctr, Owner, Stake) ->
            ),
     blockchain_txn_stake_validator_v1:sign(Txn, SigFun).
 
-neg_tx_stake_next(S, SymbTx, [Fault, Ctr, Owner, Stake]) ->
+tx_stake_next(S, SymbTx, [stake, Ctr, Owner, Stake]) ->
+    {Owner, B, Stk} = lists:keyfind(Owner, 1, S#s.accounts),
+    S#s{txs = S#s.txs ++ [#{kind => stake, validator => Ctr, account => Owner, stake => Stake, sym => SymbTx}],
+        accounts = lists:keyreplace(Owner, 1, S#s.accounts, {Owner, B - Stake, Stk + Stake}),
+        staked = S#s.staked ++ [#{idx => Ctr, stake => Stake, owner => Owner}]};
+tx_stake_next(S, SymbTx, [Fault, Ctr, Owner, Stake]) ->
     S#s{txs = S#s.txs ++ [#{kind => Fault, validator => Ctr, account => Owner, stake => Stake, sym => SymbTx}]}.
+
+%% One can either use same operation to produce both valid and invalid transactions,
+%% or use one operation for guaranteed positive and one for guaranteed negative transactions.
 
 
 %% --- Operation: unstake ---
@@ -315,8 +290,8 @@ tx_unstake_pre(S) ->
 
 tx_unstake_args(S) ->
     CoolDown = maps:get(?stake_withdrawal_cooldown, val_vars()),
-    ?LET(Kind, fault(elements([unstake_from_group, unstake_wrong_stake, short_cooldown] ++
-                                  [wrong_owner || length(S#s.accounts) > 1]), unstake),
+    ?LET(Kind, fault(elements([unstake_from_group, unstake_wrong_stake, short_cooldown, bad_sig, wrong_owner]),
+                     unstake),
     ?LET({Ctr, Stake, Owner}, elements([{Ctr, Stake, Owner} || #{idx := Ctr, stake := Stake, owner := Owner} <- S#s.staked,
                                                                Kind /= unstake_from_group orelse lists:member(Ctr, S#s.group)]),
          [Kind, Ctr, inject(S, wrong_owner, Kind, Owner),
@@ -359,7 +334,7 @@ tx_unstake_next(S, SymbTx, [Kind, Ctr, Owner, Stake, DeltaHeight]) ->
         unstake ->
             S#s{txs = S#s.txs ++ [Tx],
                 unstaked = S#s.unstaked ++ [{Ctr, Stake, S#s.height + DeltaHeight}],
-                void = S#s.void ++ [Ctr]};
+                void = S#s.void ++ [Ctr || not lists:member(Ctr, S#s.void)]};
         _ ->
             S#s{txs = S#s.txs ++ [Tx]}
     end.   %% the next block handles this Tx
@@ -378,8 +353,9 @@ tx_transfer_pre(S) ->
 
 tx_transfer_args(S) ->
     ?LET({NewCtr, {NewId, Balance, _}}, {elements(unused_validators(S)), elements(S#s.accounts)},
-    ?LET({Ctr, Stake, Owner}, elements([{Ctr, Stake, Owner} || #{idx := Ctr, stake := Stake, owner := Owner} <- S#s.staked,
-                                                               not lists:member(Ctr, S#s.group)]),
+    ?LET({Ctr, Stake, Owner}, elements([{Ctr, Stake, Owner}
+                                        || #{idx := Ctr, stake := Stake, owner := Owner} <- S#s.staked,
+                                           not lists:member(Ctr, S#s.group)]),
          [Ctr, Owner, NewCtr, NewId, Stake, oneof([0, Balance div 2, ?bones(9000)])])).
 
 tx_transfer_pre(S, [Ctr, Owner, NewCtr, NewOwner, Stake, Amount]) ->
@@ -431,7 +407,7 @@ tx_transfer_next(S, SymbTx, [Ctr, Owner, NewCtr, NewOwner, Stake, Amount]) ->
         staked = [ Staked || #{idx := Idx} = Staked <- S#s.staked, Idx /= Ctr] ++
             [#{idx => NewCtr, stake => Stake, owner => NewOwner}],
         transferred = S#s.transferred ++ [#{idx => NewCtr, stake => Stake, owner => NewOwner}],
-        void = S#s.void ++ [Ctr]}.
+        void = S#s.void ++ [Ctr || not lists:member(Ctr, S#s.void)]}.
 
 %% --- Operation: election ---
 
@@ -448,30 +424,30 @@ tx_election_pre(S) ->
 
 %% This cannot shrink nicely.. since hashes change when shrinking and selection depends on hash
 tx_election_args(S) ->
-    ?LET(Kind, case S#s.height - S#s.election_height < maps:get(?election_interval, val_vars()) of
+    ConsensusMbrs = maps:get(?num_consensus_members, val_vars()),
+    ?LET(Fault, case S#s.height - S#s.election_height < maps:get(?election_interval, val_vars()) of
                    true -> wrong_election_height;
                    false -> fault(elements([election_no_member || unused_validators(S) /= []] ++
-                                               [election_too_few_members, election_too_many_members]), election)
+                                               [election_nr_members]),
+                                  election)
                end,
     ?LET(Staked, oneof([S#s.group, noshrink(shuffle([ Idx || #{idx := Idx} <- S#s.staked]))]),
-    ?LET(NewCandidates, [elements(unused_validators(S)) || Kind == election_no_member ] ++ Staked,
-         [Kind, lists:sublist(NewCandidates, maps:get(?num_consensus_members, val_vars()) +
-                                  case Kind of
-                                      election_too_few_members -> -1;
-                                      election_too_many_members -> 1;
-                                      _ -> 0
-                                  end)]))).
+    ?LET(NewCandidates, inject(S, election_no_member, Fault, Staked),
+    ?LET(FirstN, inject(S, election_nr_members, Fault, min(ConsensusMbrs, length(NewCandidates))),
+         [Fault, lists:sublist(NewCandidates, FirstN)])))).
 
-tx_election_pre(S, [wrong_election_height, _NewGroup]) ->
-    S#s.height - S#s.election_height < maps:get(?election_interval, val_vars());  %% for shrinking
 tx_election_pre(S, [Kind, NewGroup]) ->
-        lists:all(fun(Ctr) -> lists:keymember(Ctr, 1, S#s.validator_idxs) end,
-                  NewGroup) andalso
-            (Kind /= election orelse tx_election_valid(S, [Kind, NewGroup])).
+    lists:all(fun(Ctr) -> lists:keymember(Ctr, 1, S#s.validator_idxs) end,
+              NewGroup) andalso
+        case Kind of
+            election -> tx_election_valid(S, [NewGroup]);
+            _ -> not tx_election_valid(S, [NewGroup])
+        end.
 
-tx_election_valid(S, [_Kind, NewGroup]) ->
+tx_election_valid(S, [NewGroup]) ->
     length(NewGroup) == maps:get(?num_consensus_members, val_vars()) andalso
         S#s.height - S#s.election_height >= maps:get(?election_interval, val_vars()) andalso
+        NewGroup /= S#s.group andalso %%% needed ??
         NewGroup -- [Idx || #{idx := Idx} <- S#s.staked] == [].
 
 tx_election(S, _, SymNewGroup) ->
@@ -495,7 +471,7 @@ tx_election_next(S, SymbTx, [election, NewGroup]) ->
         staked = S#s.chain_staked,
         unstaked = S#s.chain_unstaked,
         group = NewGroup,
-        void = S#s.void ++ NewGroup}.
+        void = S#s.void ++ [ Ctr || Ctr <- NewGroup, not lists:member(Ctr, S#s.void)]}.
 
 
 %% --- Operation: genesis_txs ---
@@ -599,7 +575,7 @@ add_block_next(S0, _Value, [_]) ->
         chain_staked = S#s.staked,
         chain_unstaked = S#s.unstaked,
         chain_group = S#s.group,
-        election_height = if HasValidElection -> S#s.height;
+        election_height = if HasValidElection -> S#s.height;  %% +1 ??
                              true -> S#s.election_height
                           end,
         txs = []}.
@@ -737,7 +713,6 @@ weight(S, tx_election) ->
     if S#s.height rem ElectionInterval /= 0 -> 1;
        true -> 20
     end;
-weight(_, neg_tx_stake) -> 0;
 weight(_, _) ->
     10.
 
@@ -751,7 +726,7 @@ prop_stake_txs() ->
     prop_stake_txs(#{loglevel => error}).
 
 prop_stake_txs(Opts) ->
-    fault_rate(1, 20,
+    fault_rate(maps:get(fault_percent, Opts, 5), 100,
     ?SETUP(fun() ->
                    _ = application:ensure_all_started(lager),
                    lager:set_loglevel(lager_console_backend, maps:get(loglevel, Opts, info)),
@@ -893,11 +868,14 @@ inject(_, too_little_stake, _) ->
     choose(-1, ?min_stake-1);
 inject(_, too_much_stake, _) ->
     choose(?min_stake, 2 * ?min_stake - 1);
-inject(S, wrong_owner, OwnerGen) ->
-    ?LET(Owner, OwnerGen,
-         elements([Id || {Id, _, _} <- S#s.accounts, Id /= Owner]));
+inject(S, wrong_owner, Owner) ->
+    elements([Id || {Id, _, _} <- S#s.accounts, length(S#s.accounts) < 2 orelse Id /= Owner]);
 inject(S, used_validator, _) ->
-    elements([Ctr || #{idx := Ctr} <- S#s.staked]);
+    elements(S#s.void);
+inject(S, election_no_member, Staked) ->
+    [ elements(unused_validators(S)) | Staked ];
+inject(_S, election_nr_members, Nr) ->
+    ?SUCHTHAT(N, choose(1, Nr), N /= maps:get(?num_consensus_members, val_vars()));
 inject(_, Kind, Gen) ->
     eqc_messenger:message("undefined fault injection ~p", [Kind]),
     io:format("undefined fault injection ~p", [Kind]),
